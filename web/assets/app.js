@@ -3,6 +3,7 @@ const API = Object.freeze({
   attendance: '/api/attendance',
 });
 
+const BRANCH_KEY = 'attendance.branch.v1';
 const STATUS_META = Object.freeze({
   Keldim: { iconType: 'material', iconName: 'login' },
   Ketdim: { iconType: 'material', iconName: 'logout' },
@@ -38,7 +39,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   registerServiceWorker_();
   bindEvents_();
 
-  const branch = new URLSearchParams(window.location.search).get('branch') || '';
+  const branch = resolveBranch_();
+  if (!branch && isStandalonePwa_()) {
+    showMessage_('Filial topilmadi. Ilovani ?branch=... bilan brauzerdan bir marta oching.', 'err');
+    return;
+  }
   el.branchText.textContent = `Filial: ${branch || 'Barchasi'}`;
 
   await loadBootstrap_(branch);
@@ -321,6 +326,21 @@ function registerServiceWorker_() {
     .catch((err) => {
       console.error('SW registration failed', err);
     });
+}
+
+function resolveBranch_() {
+  const fromUrl = (new URLSearchParams(window.location.search).get('branch') || '').trim();
+  if (fromUrl) {
+    localStorage.setItem(BRANCH_KEY, fromUrl);
+    return fromUrl;
+  }
+
+  const saved = (localStorage.getItem(BRANCH_KEY) || '').trim();
+  return saved;
+}
+
+function isStandalonePwa_() {
+  return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
 }
 
 function showCameraHint_(text) {
