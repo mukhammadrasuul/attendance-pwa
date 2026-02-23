@@ -292,6 +292,10 @@ async function flushQueue_() {
   }
 
   writeQueue_(failed);
+
+  if (failed.length > 0) {
+    showMessage_(`Sinxronlash navbatida: ${failed.length} ta yozuv. Tarmoq/yoki serverni tekshiring.`, 'err');
+  }
 }
 
 function readQueue_() {

@@ -35,7 +35,7 @@ function doGet() {
   return jsonResponse_({
     ok: true,
     service: 'attendance-api',
-    version: '1.2.1',
+    version: '1.2.2',
     now: new Date().toISOString(),
   });
 }
@@ -80,7 +80,7 @@ function buildBootstrap_(branch) {
       CONFIG.STATUS.OUT_START,
       CONFIG.STATUS.OUT_END,
     ],
-    apiVersion: '1.2.1',
+    apiVersion: '1.2.2',
     employeeCount: employees.length,
     serverTime: new Date().toISOString(),
   };
@@ -96,15 +96,26 @@ function submitAttendance_(payload) {
 
     // Idempotency guarantee for retried client submissions.
     if (data.requestId && attendanceIdExists_(data.requestId)) {
-      return { ok: true, deduped: true, idempotent: true, apiVersion: '1.2.1' };
+      return { ok: true, deduped: true, idempotent: true, apiVersion: '1.2.2' };
     }
 
     // Business dedupe: same employee + same status consecutively ignored.
     if (isConsecutiveDuplicate_(data.employeeId, data.status)) {
-      return { ok: true, deduped: true, idempotent: false, apiVersion: '1.2.1' };
+      return { ok: true, deduped: true, idempotent: false, apiVersion: '1.2.2' };
     }
 
-    const imagePath = saveAttendanceImageToDrive_(data.imageData, data.requestId);
+    let imagePath = '';
+    let uploadWarning = '';
+    try {
+      imagePath = saveAttendanceImageToDrive_(data.imageData, data.requestId);
+    } catch (uploadErr) {
+      // Never block attendance logging on image upload failures.
+      // Keep a deterministic placeholder path for traceability/recovery jobs.
+      const fallbackName = makeAttendanceImageFileName_(data.requestId, 'jpg');
+      imagePath = `attendance_Images/${fallbackName}`;
+      uploadWarning = `Image upload failed: ${uploadErr.message}`;
+      console.error(uploadWarning);
+    }
 
     appendAttendanceRow_({
       attendanceId: data.requestId || Utilities.getUuid(),
@@ -122,7 +133,8 @@ function submitAttendance_(payload) {
       deduped: false,
       idempotent: false,
       imagePath,
-      apiVersion: '1.2.1',
+      warning: uploadWarning,
+      apiVersion: '1.2.2',
     };
   } finally {
     lock.releaseLock();
@@ -303,7 +315,8 @@ function saveAttendanceImageToDrive_(imageDataUrl, requestId) {
   const blob = Utilities.newBlob(bytes, parsed.mimeType, fileName);
   const file = folder.createFile(blob);
 
-  return `${folder.getName()}/${file.getName()}`;
+  // Keep a stable, integration-friendly path format in sheet.
+  return `attendance_Images/${file.getName()}`;
 }
 
 function parseDataUrlImage_(dataUrl) {
