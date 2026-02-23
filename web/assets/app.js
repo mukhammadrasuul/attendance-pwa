@@ -3,6 +3,13 @@ const API = Object.freeze({
   attendance: '/api/attendance',
 });
 
+const STATUS_META = Object.freeze({
+  Keldim: { icon: '🟢' },
+  Ketdim: { icon: '🔴' },
+  'Ishim bor': { icon: '🚶' },
+  'Ishim bitdi': { icon: '↩' },
+});
+
 const QUEUE_KEY = 'attendance.queue.v1';
 
 const state = {
@@ -36,6 +43,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   await loadBootstrap_(branch);
   await initCamera_({ fromUserGesture: false });
+  updateActionState_();
 
   void flushQueue_();
 });
@@ -47,10 +55,21 @@ window.addEventListener('online', () => {
 function bindEvents_() {
   el.employeeSelect.addEventListener('change', (e) => {
     state.selectedEmployeeId = e.target.value;
+    updateActionState_();
   });
 
   el.btnCapture.addEventListener('click', async () => {
     clearMessage_();
+
+    // Retake mode: first click clears current shot and returns to live framing.
+    if (state.capturedImageData) {
+      state.capturedImageData = '';
+      el.snapshot.src = '';
+      showLive_();
+      updateActionState_();
+      showMessage_('Yangi rasm olish uchun yana bosing.', 'ok');
+      return;
+    }
 
     if (!state.cameraReady) {
       const ok = await initCamera_({ fromUserGesture: true });
@@ -75,6 +94,7 @@ function bindEvents_() {
 
     el.snapshot.src = state.capturedImageData;
     showSnapshot_();
+    updateActionState_();
     showMessage_('Rasm olindi.', 'ok');
   });
 
@@ -195,12 +215,15 @@ function renderStatuses_(statuses) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'status-btn';
-    btn.textContent = status;
+    const icon = STATUS_META[status]?.icon || '•';
+    btn.innerHTML = `<span class="status-icon">${icon}</span><span class="status-text">${escapeHtml_(status)}</span>`;
+    btn.setAttribute('aria-label', status);
 
     btn.addEventListener('click', () => {
       state.selectedStatus = status;
       [...el.statusGrid.querySelectorAll('.status-btn')].forEach((node) => node.classList.remove('active'));
       btn.classList.add('active');
+      updateActionState_();
     });
 
     el.statusGrid.appendChild(btn);
@@ -226,6 +249,7 @@ function resetForm_() {
   [...el.statusGrid.querySelectorAll('.status-btn')].forEach((node) => node.classList.remove('active'));
 
   showLive_();
+  updateActionState_();
 }
 
 function enqueue_(entry) {
@@ -316,4 +340,22 @@ function randomId_() {
     return window.crypto.randomUUID();
   }
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function updateActionState_() {
+  const hasEmployee = Boolean(state.selectedEmployeeId);
+  const hasStatus = Boolean(state.selectedStatus);
+  const hasPhoto = Boolean(state.capturedImageData);
+
+  // Save is enabled only when payload is complete.
+  el.btnSave.disabled = !(hasEmployee && hasStatus && hasPhoto);
+
+  // Capture button doubles as retake action after first shot.
+  if (hasPhoto) {
+    el.btnCapture.textContent = 'Qaytadan rasmga olish';
+    el.btnCapture.classList.add('retake');
+  } else {
+    el.btnCapture.textContent = 'Rasmga Olish';
+    el.btnCapture.classList.remove('retake');
+  }
 }

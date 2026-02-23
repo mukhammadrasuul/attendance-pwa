@@ -6,6 +6,12 @@
   --muted: #6b7280;
   --primary: #0f766e;
   --primary-dark: #0d5f58;
+  --capture: #2563eb;
+  --capture-dark: #1d4ed8;
+  --retake: #d97706;
+  --retake-dark: #b45309;
+  --save: #059669;
+  --save-dark: #047857;
   --success: #166534;
   --success-bg: #dcfce7;
   --danger: #b91c1c;
@@ -42,18 +48,6 @@ body {
   font-size: 20px;
 }
 
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.brand img {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
-}
-
 .header p {
   margin: 4px 0 12px;
   color: var(--muted);
@@ -79,22 +73,40 @@ select {
 .status-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  gap: 10px;
 }
 
 .status-btn {
-  height: 42px;
+  min-height: 58px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 12px;
   background: #fff;
   font-weight: 600;
   cursor: pointer;
+  text-align: left;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 1.2;
 }
 
 .status-btn.active {
   border-color: var(--primary);
   background: var(--primary);
   color: #fff;
+  box-shadow: 0 6px 14px rgba(15, 118, 110, 0.22);
+}
+
+.status-icon {
+  font-size: 18px;
+  width: 24px;
+  text-align: center;
+  flex: 0 0 24px;
+}
+
+.status-text {
+  font-size: 14px;
 }
 
 .camera-shell {
@@ -146,15 +158,45 @@ img {
 .actions button {
   border: 0;
   border-radius: 10px;
-  height: 44px;
-  background: var(--primary);
+  min-height: 48px;
   color: #fff;
   font-weight: 700;
   cursor: pointer;
+  transition: 0.16s ease;
 }
 
-.actions button:hover {
-  background: var(--primary-dark);
+.btn-capture {
+  background: var(--capture);
+}
+
+.btn-capture:hover {
+  background: var(--capture-dark);
+}
+
+.btn-capture.retake {
+  background: var(--retake);
+}
+
+.btn-capture.retake:hover {
+  background: var(--retake-dark);
+}
+
+.btn-save {
+  background: var(--save);
+}
+
+.btn-save:hover {
+  background: var(--save-dark);
+}
+
+.actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.actions button:not(:disabled):active {
+  transform: translateY(1px);
 }
 
 .message {
