@@ -32,7 +32,7 @@ function doGet() {
   return jsonResponse_({
     ok: true,
     service: 'attendance-api',
-    version: '1.0.0',
+    version: '1.1.0',
     now: new Date().toISOString(),
   });
 }
@@ -66,16 +66,19 @@ function doPost(e) {
 /* ------------------------------ API Services ------------------------------ */
 
 function buildBootstrap_(branch) {
+  const employees = getActiveEmployeesByBranch_(branch);
   return {
     ok: true,
     branch,
-    employees: getActiveEmployeesByBranch_(branch),
+    employees,
     statuses: [
       CONFIG.STATUS.ARRIVED,
       CONFIG.STATUS.LEFT,
       CONFIG.STATUS.OUT_START,
       CONFIG.STATUS.OUT_END,
     ],
+    apiVersion: '1.1.0',
+    employeeCount: employees.length,
     serverTime: new Date().toISOString(),
   };
 }
@@ -150,8 +153,33 @@ function validateSubmission_(payload) {
 /* ------------------------------ Spreadsheet Access ------------------------------ */
 
 function getSpreadsheet_() {
-  const id = getRequiredProperty_('SPREADSHEET_ID');
-  return SpreadsheetApp.openById(id);
+  const rawRef = getRequiredProperty_('SPREADSHEET_ID').trim();
+  const spreadsheetId = extractSpreadsheetId_(rawRef);
+
+  // 1) If full URL is provided, try URL first.
+  if (/^https?:\/\//i.test(rawRef)) {
+    try {
+      return SpreadsheetApp.openByUrl(rawRef);
+    } catch (_errByUrl) {
+      // fall through to id-based open
+    }
+  }
+
+  // 2) ID-based open.
+  try {
+    return SpreadsheetApp.openById(spreadsheetId);
+  } catch (_errById) {
+    // 3) DriveApp fallback avoids some intermittent openById runtime issues.
+    try {
+      const file = DriveApp.getFileById(spreadsheetId);
+      return SpreadsheetApp.open(file);
+    } catch (errByDrive) {
+      throw httpError_(
+        500,
+        `Unable to open spreadsheet from SPREADSHEET_ID. Check property value, share permissions, and deployment auth. Detail: ${errByDrive.message}`
+      );
+    }
+  }
 }
 
 function getSheetOrThrow_(name) {
@@ -164,6 +192,19 @@ function getRequiredProperty_(name) {
   const value = PropertiesService.getScriptProperties().getProperty(name);
   if (!value) throw httpError_(500, `Missing script property: ${name}`);
   return value;
+}
+
+function extractSpreadsheetId_(rawRef) {
+  const ref = String(rawRef || '').trim();
+  if (!ref) throw httpError_(500, 'SPREADSHEET_ID is empty');
+
+  // Accept either:
+  // 1) Plain spreadsheet id
+  // 2) Full spreadsheet URL
+  const urlMatch = ref.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (urlMatch && urlMatch[1]) return urlMatch[1];
+
+  return ref;
 }
 
 /* ------------------------------ Employee / Branch ------------------------------ */

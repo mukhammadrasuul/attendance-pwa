@@ -48,6 +48,11 @@ This project implements a decoupled architecture:
 - `GAS_SHARED_SECRET` = same value as Apps Script `API_SHARED_SECRET`
 5. Trigger redeploy.
 
+Important:
+- After every `Code.gs` change, create a **new Apps Script deployment version**.
+- Verify backend version quickly by opening your Apps Script URL in browser:
+  - Expected JSON field: `version: "1.1.0"`
+
 ## 5) Usage
 
 1. Open your Netlify URL with branch parameter, for example:
@@ -112,6 +117,7 @@ Notes:
 - Wrong `SPREADSHEET_ID`
 - Wrong branch value in URL
 - Branch naming mismatch in sheet
+- Old Apps Script deployment still active (new code not deployed)
 
 2. Unauthorized backend response:
 - `GAS_SHARED_SECRET` and `API_SHARED_SECRET` mismatch
@@ -120,3 +126,8 @@ Notes:
 - Site permissions blocked in browser settings
 - Non-HTTPS URL
 - Laptop camera in use by another application
+
+4. Custom logo in installed PWA:
+- Replace `/Users/macbookair13/Documents/appscript based attendance form/web/assets/logo.png` with your own logo.
+- Keep `/Users/macbookair13/Documents/appscript based attendance form/web/assets/icon.png` aligned with the same logo.
+- Redeploy Netlify, then uninstall/reinstall the PWA to refresh icon cache.

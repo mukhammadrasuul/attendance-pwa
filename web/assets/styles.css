@@ -42,6 +42,18 @@ body {
   font-size: 20px;
 }
 
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand img {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+}
+
 .header p {
   margin: 4px 0 12px;
   color: var(--muted);
