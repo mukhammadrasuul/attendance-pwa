@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="uz">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f766e" />
+    <title>Aniq Tizim Attendance</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <section class="card">
+        <header class="header">
+          <h1>Davomat</h1>
+          <p id="branchText">Filial: ...</p>
+        </header>
+
+        <label for="employeeSelect">Xodim</label>
+        <select id="employeeSelect">
+          <option value="">Tanlang...</option>
+        </select>
+
+        <label>Holat</label>
+        <div class="status-grid" id="statusGrid"></div>
+
+        <div class="camera-shell">
+          <video id="liveVideo" autoplay playsinline muted></video>
+          <img id="snapshot" alt="Captured" />
+          <p id="cameraHint" class="hint"></p>
+        </div>
+        <canvas id="captureCanvas"></canvas>
+
+        <div class="actions">
+          <button id="btnCapture" type="button">Rasmga Olish</button>
+          <button id="btnSave" type="button">Saqlash</button>
+        </div>
+
+        <p id="message" class="message"></p>
+      </section>
+    </main>
+
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

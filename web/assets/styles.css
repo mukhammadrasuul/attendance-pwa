@@ -1,0 +1,166 @@
+:root {
+  --bg: #f4f6f8;
+  --card: #ffffff;
+  --line: #e6e8ec;
+  --text: #111827;
+  --muted: #6b7280;
+  --primary: #0f766e;
+  --primary-dark: #0d5f58;
+  --success: #166534;
+  --success-bg: #dcfce7;
+  --danger: #b91c1c;
+  --danger-bg: #fee2e2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  color: var(--text);
+  background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+}
+
+.container {
+  max-width: 560px;
+  margin: 20px auto;
+  padding: 12px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 14px;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.header p {
+  margin: 4px 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+label {
+  display: block;
+  margin: 10px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+select {
+  width: 100%;
+  height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0 10px;
+  background: #fff;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.status-btn {
+  height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.status-btn.active {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+
+.camera-shell {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  position: relative;
+  background: #0b1220;
+  aspect-ratio: 16/10;
+}
+
+video,
+img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+#snapshot {
+  display: none;
+}
+
+#captureCanvas {
+  display: none;
+}
+
+.hint {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+  display: none;
+}
+
+.actions {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.actions button {
+  border: 0;
+  border-radius: 10px;
+  height: 44px;
+  background: var(--primary);
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.actions button:hover {
+  background: var(--primary-dark);
+}
+
+.message {
+  display: none;
+  border-radius: 10px;
+  margin: 10px 0 0;
+  padding: 10px;
+  font-size: 13px;
+}
+
+.message.ok {
+  display: block;
+  color: var(--success);
+  background: var(--success-bg);
+}
+
+.message.err {
+  display: block;
+  color: var(--danger);
+  background: var(--danger-bg);
+}
