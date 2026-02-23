@@ -301,9 +301,14 @@ function writeQueue_(queue) {
 
 function registerServiceWorker_() {
   if (!('serviceWorker' in navigator)) return;
-  navigator.serviceWorker.register('/sw.js').catch((err) => {
-    console.error('SW registration failed', err);
-  });
+  navigator.serviceWorker.register('/sw.js')
+    .then((registration) => {
+      // Pull latest worker on each page load so deploys appear quickly.
+      registration.update();
+    })
+    .catch((err) => {
+      console.error('SW registration failed', err);
+    });
 }
 
 function showCameraHint_(text) {
