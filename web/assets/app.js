@@ -4,8 +4,8 @@ const API = Object.freeze({
 });
 
 const STATUS_META = Object.freeze({
-  Keldim: { icon: '🟢' },
-  Ketdim: { icon: '🔴' },
+  Keldim: { iconType: 'material', iconName: 'login' },
+  Ketdim: { iconType: 'material', iconName: 'logout' },
   'Ishim bor': { icon: '🚶' },
   'Ishim bitdi': { icon: '↩' },
 });
@@ -215,8 +215,11 @@ function renderStatuses_(statuses) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'status-btn';
-    const icon = STATUS_META[status]?.icon || '•';
-    btn.innerHTML = `<span class="status-icon">${icon}</span><span class="status-text">${escapeHtml_(status)}</span>`;
+    const meta = STATUS_META[status] || {};
+    const iconHtml = meta.iconType === 'material'
+      ? `<span class="status-icon material-symbols-outlined status-material">${escapeHtml_(meta.iconName || 'check')}</span>`
+      : `<span class="status-icon">${escapeHtml_(meta.icon || '•')}</span>`;
+    btn.innerHTML = `${iconHtml}<span class="status-text">${escapeHtml_(status)}</span>`;
     btn.setAttribute('aria-label', status);
 
     btn.addEventListener('click', () => {

@@ -23,6 +23,9 @@ const CONFIG = Object.freeze({
     OUT_START: 'Ishim bor',
     OUT_END: 'Ishim bitdi',
   }),
+  DRIVE: Object.freeze({
+    ATTENDANCE_FOLDER_ID: '1kiqoaAJDx3967MzfcsgQVNCFggQ2aPSV',
+  }),
   TIMEZONE: Session.getScriptTimeZone() || 'Asia/Tashkent',
 });
 
@@ -32,7 +35,7 @@ function doGet() {
   return jsonResponse_({
     ok: true,
     service: 'attendance-api',
-    version: '1.1.0',
+    version: '1.2.0',
     now: new Date().toISOString(),
   });
 }
@@ -77,7 +80,7 @@ function buildBootstrap_(branch) {
       CONFIG.STATUS.OUT_START,
       CONFIG.STATUS.OUT_END,
     ],
-    apiVersion: '1.1.0',
+    apiVersion: '1.2.0',
     employeeCount: employees.length,
     serverTime: new Date().toISOString(),
   };
@@ -101,12 +104,14 @@ function submitAttendance_(payload) {
       return { ok: true, deduped: true, idempotent: false };
     }
 
+    const imagePath = saveAttendanceImageToDrive_(data.imageData, data.requestId);
+
     appendAttendanceRow_({
       attendanceId: data.requestId || Utilities.getUuid(),
       employeeId: data.employeeId,
       datetime: now,
       status: data.status,
-      imageData: data.imageData,
+      imagePath,
     });
 
     recalcDailyStatForEmployeeDate_(data.employeeId, now);
@@ -274,8 +279,65 @@ function appendAttendanceRow_(row) {
     row.employeeId,
     row.datetime,
     row.status,
-    row.imageData,
+    row.imagePath,
   ]);
+}
+
+/**
+ * Saves data-url image into target Drive folder and returns sheet path value.
+ * Example output: attendance_Images/bb7c88eb.1770876524190.jpg
+ */
+function saveAttendanceImageToDrive_(imageDataUrl, requestId) {
+  const parsed = parseDataUrlImage_(imageDataUrl);
+  const folder = getAttendanceImageFolder_();
+  const ext = extensionFromMimeType_(parsed.mimeType);
+  const fileName = makeAttendanceImageFileName_(requestId, ext);
+
+  const bytes = Utilities.base64Decode(parsed.base64Data);
+  const blob = Utilities.newBlob(bytes, parsed.mimeType, fileName);
+  const file = folder.createFile(blob);
+
+  return `${folder.getName()}/${file.getName()}`;
+}
+
+function parseDataUrlImage_(dataUrl) {
+  const raw = String(dataUrl || '').trim();
+  const match = raw.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) throw httpError_(400, 'Invalid image data URL format');
+
+  return {
+    mimeType: match[1],
+    base64Data: match[2],
+  };
+}
+
+function extensionFromMimeType_(mimeType) {
+  const map = {
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+  };
+  return map[String(mimeType || '').toLowerCase()] || 'jpg';
+}
+
+function makeAttendanceImageFileName_(requestId, ext) {
+  const raw = String(requestId || Utilities.getUuid()).toLowerCase();
+  const safe = raw.replace(/[^a-z0-9]/g, '');
+  const shortId = (safe || Utilities.getUuid().replace(/-/g, '')).slice(0, 8);
+  return `${shortId}.${Date.now()}.${ext}`;
+}
+
+function getAttendanceImageFolder_() {
+  const folderId = CONFIG.DRIVE.ATTENDANCE_FOLDER_ID;
+  try {
+    return DriveApp.getFolderById(folderId);
+  } catch (err) {
+    throw httpError_(
+      500,
+      `Attendance image folder is not accessible. Verify folder ID and script permissions. Detail: ${err.message}`
+    );
+  }
 }
 
 function attendanceIdExists_(attendanceId) {

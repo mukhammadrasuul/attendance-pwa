@@ -105,6 +105,16 @@ select {
   flex: 0 0 24px;
 }
 
+.material-symbols-outlined.status-material {
+  font-size: 20px;
+  font-variation-settings:
+    'FILL' 0,
+    'wght' 600,
+    'GRAD' 0,
+    'opsz' 24;
+  line-height: 1;
+}
+
 .status-text {
   font-size: 14px;
 }
