@@ -35,7 +35,7 @@ function doGet() {
   return jsonResponse_({
     ok: true,
     service: 'attendance-api',
-    version: '1.2.0',
+    version: '1.2.1',
     now: new Date().toISOString(),
   });
 }
@@ -80,7 +80,7 @@ function buildBootstrap_(branch) {
       CONFIG.STATUS.OUT_START,
       CONFIG.STATUS.OUT_END,
     ],
-    apiVersion: '1.2.0',
+    apiVersion: '1.2.1',
     employeeCount: employees.length,
     serverTime: new Date().toISOString(),
   };
@@ -96,12 +96,12 @@ function submitAttendance_(payload) {
 
     // Idempotency guarantee for retried client submissions.
     if (data.requestId && attendanceIdExists_(data.requestId)) {
-      return { ok: true, deduped: true, idempotent: true };
+      return { ok: true, deduped: true, idempotent: true, apiVersion: '1.2.1' };
     }
 
     // Business dedupe: same employee + same status consecutively ignored.
     if (isConsecutiveDuplicate_(data.employeeId, data.status)) {
-      return { ok: true, deduped: true, idempotent: false };
+      return { ok: true, deduped: true, idempotent: false, apiVersion: '1.2.1' };
     }
 
     const imagePath = saveAttendanceImageToDrive_(data.imageData, data.requestId);
@@ -117,7 +117,13 @@ function submitAttendance_(payload) {
     recalcDailyStatForEmployeeDate_(data.employeeId, now);
     recalcMonthlyStatForEmployeeMonth_(data.employeeId, now);
 
-    return { ok: true, deduped: false, idempotent: false };
+    return {
+      ok: true,
+      deduped: false,
+      idempotent: false,
+      imagePath,
+      apiVersion: '1.2.1',
+    };
   } finally {
     lock.releaseLock();
   }

@@ -51,7 +51,7 @@ This project implements a decoupled architecture:
 Important:
 - After every `Code.gs` change, create a **new Apps Script deployment version**.
 - Verify backend version quickly by opening your Apps Script URL in browser:
-  - Expected JSON field: `version: "1.1.0"`
+  - Expected JSON field: `version: "1.2.1"`
 
 ## 5) Usage
 
@@ -129,5 +129,7 @@ Notes:
 
 4. Custom logo in installed PWA:
 - Replace `/Users/macbookair13/Documents/appscript based attendance form/web/assets/logo.png` with your own logo.
-- Keep `/Users/macbookair13/Documents/appscript based attendance form/web/assets/icon.png` aligned with the same logo.
+- Installed PWA icon files are:
+  - `/Users/macbookair13/Documents/appscript based attendance form/web/assets/icon-192.png`
+  - `/Users/macbookair13/Documents/appscript based attendance form/web/assets/icon-512.png`
 - Redeploy Netlify, then uninstall/reinstall the PWA to refresh icon cache.

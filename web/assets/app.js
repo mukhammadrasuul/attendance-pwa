@@ -280,6 +280,11 @@ async function flushQueue_() {
       const data = await res.json();
       if (!res.ok || !data.ok) {
         failed.push(item);
+      } else {
+        // Useful for production diagnostics to confirm backend version and Drive path storage.
+        if (data.apiVersion) {
+          console.info('Attendance accepted by API version:', data.apiVersion, 'imagePath:', data.imagePath || '');
+        }
       }
     } catch (_err) {
       failed.push(item);
