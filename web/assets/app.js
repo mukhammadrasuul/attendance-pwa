@@ -1,6 +1,7 @@
 const API = Object.freeze({
   bootstrap: '/api/bootstrap',
   attendance: '/api/attendance',
+  attendanceImage: '/api/attendance-image',
 });
 
 const BRANCH_KEY = 'attendance.branch.v1';
@@ -19,6 +20,8 @@ const state = {
   stream: null,
   cameraReady: false,
   saveInFlight: false,
+  imageUploadInFlight: false,
+  imageUploadQueue: [],
   toastTimer: null,
 };
 
@@ -49,6 +52,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   await loadBootstrap_(branch);
   await initCamera_({ fromUserGesture: false });
   updateActionState_();
+});
+
+window.addEventListener('online', () => {
+  // Best-effort retry for deferred image uploads.
+  void flushImageUploads_();
 });
 
 function bindEvents_() {
@@ -113,11 +121,12 @@ function bindEvents_() {
       return;
     }
 
+    const capturedImageData = state.capturedImageData;
     const request = {
       requestId: randomId_(),
       employeeId: state.selectedEmployeeId,
       status: state.selectedStatus,
-      imageData: state.capturedImageData,
+      deferImageUpload: true,
       capturedAt: new Date().toISOString(),
     };
 
@@ -135,6 +144,16 @@ function bindEvents_() {
         showMessage_('Takror holat aniqlandi. Yangi qator qo‘shilmadi.', 'ok', { autoHideMs: 2000 });
       } else {
         showMessage_('Muvaffaqiyatli saqlandi.', 'ok', { autoHideMs: 2000 });
+      }
+
+      if (result.wroteNewRow && result.attendanceId) {
+        enqueueImageUpload_({
+          attendanceId: result.attendanceId,
+          imagePath: result.imagePath || '',
+          imageData: capturedImageData,
+          tries: 0,
+        });
+        void flushImageUploads_();
       }
 
       resetForm_();
@@ -302,6 +321,77 @@ async function submitAttendanceRequest_(request) {
   }
 
   return data;
+}
+
+function enqueueImageUpload_(entry) {
+  state.imageUploadQueue.push(entry);
+}
+
+async function flushImageUploads_() {
+  if (state.imageUploadInFlight) return;
+  if (state.imageUploadQueue.length === 0) return;
+  if (!navigator.onLine) return;
+
+  state.imageUploadInFlight = true;
+  try {
+    while (state.imageUploadQueue.length > 0) {
+      const current = state.imageUploadQueue[0];
+      try {
+        const result = await submitAttendanceImageRequest_(current);
+        if (!result.ok) {
+          throw new Error(result.error || 'Image upload failed');
+        }
+        state.imageUploadQueue.shift();
+      } catch (err) {
+        current.tries = Number(current.tries || 0) + 1;
+        if (current.tries >= 3) {
+          state.imageUploadQueue.shift();
+          showMessage_('Davomat saqlandi, lekin rasm yuklanmadi. Internetni tekshirib qayta urinib ko‘ring.', 'err');
+        } else {
+          // Retry later without blocking user workflow.
+          await waitMs_(1200 * current.tries);
+        }
+      }
+    }
+  } finally {
+    state.imageUploadInFlight = false;
+  }
+}
+
+async function submitAttendanceImageRequest_(payload) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 25000);
+  let res;
+  try {
+    res = await fetch(API.attendanceImage, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  let data = {};
+  try {
+    data = await res.json();
+  } catch (_parseErr) {
+    data = { ok: false, error: 'Serverdan noto‘g‘ri javob qaytdi.' };
+  }
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: data.error || `HTTP ${res.status} xatolik`,
+    };
+  }
+
+  return data;
+}
+
+function waitMs_(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function setSaveLoading_(isLoading) {

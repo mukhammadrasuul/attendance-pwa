@@ -47,6 +47,17 @@ exports.handler = async (event) => {
       return response_(200, data);
     }
 
+    if (event.httpMethod === 'POST' && route === 'attendance-image') {
+      const parsedBody = parseJsonSafe_(event.body || '{}');
+      const payload = {
+        action: 'uploadAttendanceImage',
+        apiKey: sharedSecret,
+        payload: parsedBody,
+      };
+      const data = await postToGas_(gasUrl, payload);
+      return response_(200, data);
+    }
+
     return response_(404, { ok: false, error: 'Not Found' });
   } catch (err) {
     console.error(err);

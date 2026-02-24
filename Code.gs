@@ -72,6 +72,10 @@ function doPost(e) {
       return jsonResponse_(submitAttendance_(body.payload || {}));
     }
 
+    if (action === 'uploadAttendanceImage') {
+      return jsonResponse_(uploadAttendanceImage_(body.payload || {}));
+    }
+
     throw httpError_(400, `Unsupported action: ${action}`);
   } catch (err) {
     console.error(err);
@@ -139,7 +143,12 @@ function submitAttendance_(payload) {
 
     const now = new Date();
     const attendanceId = data.requestId || Utilities.getUuid();
-    const imagePath = storeAttendanceImagePath_(data.imageData, attendanceId);
+    const imagePath = `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(attendanceId, 'jpg')}`;
+
+    if (!data.deferImageUpload) {
+      // Backward-compatible mode if client still sends image in write request.
+      storeAttendanceImagePath_(data.imageData, attendanceId, imagePath);
+    }
 
     appendAttendanceRow_({
       attendanceId,
@@ -155,6 +164,33 @@ function submitAttendance_(payload) {
       wroteNewRow: true,
       deduped: false,
       idempotent: false,
+      attendanceId,
+      imagePath,
+      imageDeferred: data.deferImageUpload,
+      apiVersion: CONFIG.VERSION,
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Background attachment upload endpoint.
+ * Does not affect attendance write confirmation flow.
+ */
+function uploadAttendanceImage_(payload) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+
+  try {
+    const data = validateImageUploadPayload_(payload);
+    const imagePath = storeAttendanceImagePath_(data.imageData, data.attendanceId, data.imagePath);
+    updateAttendanceImagePathById_(data.attendanceId, imagePath);
+
+    return {
+      ok: true,
+      persisted: true,
+      attendanceId: data.attendanceId,
       imagePath,
       apiVersion: CONFIG.VERSION,
     };
@@ -363,12 +399,28 @@ function validateSubmission_(payload) {
   const status = String(payload.status || '').trim();
   const imageData = String(payload.imageData || '').trim();
   const requestId = String(payload.requestId || '').trim();
+  const deferImageUpload = Boolean(payload.deferImageUpload);
 
   if (!employeeId) throw httpError_(400, 'employeeId is required');
   if (!Object.values(CONFIG.STATUS).includes(status)) throw httpError_(400, 'Invalid status');
+  if (!deferImageUpload && !imageData.startsWith('data:image/')) {
+    throw httpError_(400, 'imageData must be data URL');
+  }
+
+  return { employeeId, status, imageData, requestId, deferImageUpload };
+}
+
+function validateImageUploadPayload_(payload) {
+  if (!payload || typeof payload !== 'object') throw httpError_(400, 'payload must be an object');
+
+  const attendanceId = String(payload.attendanceId || '').trim();
+  const imageData = String(payload.imageData || '').trim();
+  const imagePath = String(payload.imagePath || '').trim();
+
+  if (!attendanceId) throw httpError_(400, 'attendanceId is required');
   if (!imageData.startsWith('data:image/')) throw httpError_(400, 'imageData must be data URL');
 
-  return { employeeId, status, imageData, requestId };
+  return { attendanceId, imageData, imagePath };
 }
 
 /* ------------------------------ Spreadsheet Access ------------------------------ */
@@ -565,27 +617,42 @@ function getAttendanceTailValues_(sheet, startCol, numCols, lookbackRows) {
 
 /* ------------------------------ Image Storage ------------------------------ */
 
-function storeAttendanceImagePath_(imageDataUrl, requestId) {
+function storeAttendanceImagePath_(imageDataUrl, requestId, preferredPath) {
   try {
-    return saveAttendanceImageToDrive_(imageDataUrl, requestId);
+    return saveAttendanceImageToDrive_(imageDataUrl, requestId, preferredPath);
   } catch (err) {
     // Keep attendance write reliable even when Drive upload fails.
     console.error(`Image upload failed, fallback path used: ${err.message}`);
+    if (preferredPath) return preferredPath;
     return `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(requestId, 'jpg')}`;
   }
 }
 
-function saveAttendanceImageToDrive_(imageDataUrl, requestId) {
+function saveAttendanceImageToDrive_(imageDataUrl, requestId, preferredPath) {
   const parsed = parseDataUrlImage_(imageDataUrl);
   const folder = getAttendanceImageFolder_();
   const ext = extensionFromMimeType_(parsed.mimeType);
-  const fileName = makeAttendanceImageFileName_(requestId, ext);
+  const preferredFileName = fileNameFromPath_(preferredPath);
+  const fileName = preferredFileName || makeAttendanceImageFileName_(requestId, ext);
+
+  // Retry-safe idempotency: if same filename already uploaded, reuse it.
+  const existing = folder.getFilesByName(fileName);
+  if (existing.hasNext()) {
+    return `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${fileName}`;
+  }
 
   const bytes = Utilities.base64Decode(parsed.base64Data);
   const blob = Utilities.newBlob(bytes, parsed.mimeType, fileName);
   const file = folder.createFile(blob);
 
   return `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${file.getName()}`;
+}
+
+function fileNameFromPath_(pathValue) {
+  const raw = String(pathValue || '').trim();
+  if (!raw) return '';
+  const parts = raw.split('/');
+  return String(parts[parts.length - 1] || '').trim();
 }
 
 function parseDataUrlImage_(dataUrl) {
@@ -619,6 +686,44 @@ function getAttendanceImageFolder_() {
   } catch (err) {
     throw httpError_(500, `Attendance image folder is not accessible. Detail: ${err.message}`);
   }
+}
+
+function updateAttendanceImagePathById_(attendanceId, imagePath) {
+  const rowNumber = findAttendanceRowById_(attendanceId);
+  if (!rowNumber) return false;
+
+  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+  sheet.getRange(rowNumber, 5).setValue(imagePath);
+  return true;
+}
+
+function findAttendanceRowById_(attendanceId) {
+  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+  const id = String(attendanceId || '').trim();
+  if (!id) return 0;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return 0;
+
+  // Fast pass over recent rows.
+  const rowsToRead = Math.min(lastRow - 1, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
+  const startRow = lastRow - rowsToRead + 1;
+  const recentIds = sheet.getRange(startRow, 1, rowsToRead, 1).getValues();
+  for (let i = recentIds.length - 1; i >= 0; i -= 1) {
+    if (String(recentIds[i][0] || '').trim() === id) {
+      return startRow + i;
+    }
+  }
+
+  // Full fallback for older rows.
+  const allIds = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  for (let i = allIds.length - 1; i >= 0; i -= 1) {
+    if (String(allIds[i][0] || '').trim() === id) {
+      return i + 2;
+    }
+  }
+
+  return 0;
 }
 
 /* ------------------------------ Daily Stats Worker ------------------------------ */

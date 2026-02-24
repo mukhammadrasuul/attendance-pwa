@@ -3,8 +3,9 @@
 This version is optimized for reliability and speed:
 
 1. API write path saves only to `attendance` (fast).
-2. Daily statistics are updated by a background worker.
-3. Monthly statistics are updated by a nightly worker.
+2. Image upload runs as background follow-up request after attendance is persisted.
+3. Daily statistics are updated by a background worker.
+4. Monthly statistics are updated by a nightly worker.
 
 ## Files
 
@@ -69,16 +70,17 @@ If you want to process all history, do not run this initializer.
 ## 5) Runtime Flow
 
 1. Frontend calls `/api/attendance`.
-2. Apps Script validates, dedupes, stores image to Drive path, writes one row to `attendance`.
-3. `processAttendanceToDailyStats` updates `statistika` asynchronously.
-4. `runNightlyMonthlyRollup` updates `monthly statistics` once per night.
+2. Apps Script validates, dedupes, writes one row to `attendance` immediately.
+3. Frontend uploads image in background to attach it by `attendanceId`.
+4. `processAttendanceToDailyStats` updates `statistika` asynchronously.
+5. `runNightlyMonthlyRollup` updates `monthly statistics` once per night.
 
 ## 6) API Behavior Guarantees
 
 1. Success is returned only when attendance write is persisted.
 2. Duplicate consecutive status is silently ignored (dedupe).
 3. `requestId` retries are idempotent.
-4. If image upload fails, attendance still writes with fallback path format.
+4. If background image upload fails, attendance row remains persisted and image upload is retried while app is open.
 
 ## 7) Testing Checklist
 
