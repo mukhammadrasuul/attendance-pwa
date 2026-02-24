@@ -80,7 +80,7 @@ function bindEvents_() {
       return;
     }
 
-    const width = 720;
+    const width = 480;
     const height = Math.round((el.liveVideo.videoHeight / el.liveVideo.videoWidth) * width);
 
     el.captureCanvas.width = width;
@@ -89,7 +89,7 @@ function bindEvents_() {
     const ctx = el.captureCanvas.getContext('2d', { alpha: false });
     ctx.drawImage(el.liveVideo, 0, 0, width, height);
 
-    state.capturedImageData = el.captureCanvas.toDataURL('image/jpeg', 0.82);
+    state.capturedImageData = el.captureCanvas.toDataURL('image/jpeg', 0.62);
 
     el.snapshot.src = state.capturedImageData;
     showSnapshot_();

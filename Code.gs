@@ -26,6 +26,13 @@ const CONFIG = Object.freeze({
   DRIVE: Object.freeze({
     ATTENDANCE_FOLDER_ID: '1kiqoaAJDx3967MzfcsgQVNCFggQ2aPSV',
   }),
+  PERF: Object.freeze({
+    // Scan only recent rows for idempotency + duplicate checks (fast and sufficient for retry windows).
+    ATTENDANCE_LOOKBACK_ROWS: 1500,
+    // Monthly rollup is expensive on each write. Keep it off for low-latency saves.
+    // Set script property MONTHLY_RECALC_ON_WRITE=true if immediate monthly updates are required.
+    MONTHLY_RECALC_ON_WRITE: getBooleanProperty_('MONTHLY_RECALC_ON_WRITE', false),
+  }),
   TIMEZONE: Session.getScriptTimeZone() || 'Asia/Tashkent',
 });
 
@@ -35,7 +42,7 @@ function doGet() {
   return jsonResponse_({
     ok: true,
     service: 'attendance-api',
-    version: '1.3.0',
+    version: '1.4.0',
     now: new Date().toISOString(),
   });
 }
@@ -80,7 +87,7 @@ function buildBootstrap_(branch) {
       CONFIG.STATUS.OUT_START,
       CONFIG.STATUS.OUT_END,
     ],
-    apiVersion: '1.3.0',
+    apiVersion: '1.4.0',
     employeeCount: employees.length,
     serverTime: new Date().toISOString(),
   };
@@ -102,7 +109,7 @@ function submitAttendance_(payload) {
         wroteNewRow: false,
         deduped: true,
         idempotent: true,
-        apiVersion: '1.3.0',
+        apiVersion: '1.4.0',
       };
     }
 
@@ -114,7 +121,7 @@ function submitAttendance_(payload) {
         wroteNewRow: false,
         deduped: true,
         idempotent: false,
-        apiVersion: '1.3.0',
+        apiVersion: '1.4.0',
       };
     }
 
@@ -142,7 +149,9 @@ function submitAttendance_(payload) {
 
     try {
       recalcDailyStatForEmployeeDate_(data.employeeId, now);
-      recalcMonthlyStatForEmployeeMonth_(data.employeeId, now);
+      if (CONFIG.PERF.MONTHLY_RECALC_ON_WRITE) {
+        recalcMonthlyStatForEmployeeMonth_(data.employeeId, now);
+      }
     } catch (statsErr) {
       const statsWarning = `Attendance saved, but statistics update failed: ${statsErr.message}`;
       warnings.push(statsWarning);
@@ -157,7 +166,7 @@ function submitAttendance_(payload) {
       idempotent: false,
       imagePath,
       warning: warnings.join(' | '),
-      apiVersion: '1.3.0',
+      apiVersion: '1.4.0',
     };
   } finally {
     lock.releaseLock();
@@ -240,6 +249,13 @@ function getRequiredProperty_(name) {
   return value;
 }
 
+function getBooleanProperty_(name, defaultValue) {
+  const value = PropertiesService.getScriptProperties().getProperty(name);
+  if (value === null || value === undefined || value === '') return Boolean(defaultValue);
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
 function extractSpreadsheetId_(rawRef) {
   const ref = String(rawRef || '').trim();
   if (!ref) throw httpError_(500, 'SPREADSHEET_ID is empty');
@@ -251,6 +267,16 @@ function extractSpreadsheetId_(rawRef) {
   if (urlMatch && urlMatch[1]) return urlMatch[1];
 
   return ref;
+}
+
+function getAttendanceTailValues_(sheet, startCol, numCols, lookbackRows) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return [];
+
+  const dataRows = lastRow - 1;
+  const rowsToRead = Math.min(dataRows, Math.max(1, Number(lookbackRows) || 1000));
+  const startRow = lastRow - rowsToRead + 1;
+  return sheet.getRange(startRow, startCol, rowsToRead, numCols).getValues();
 }
 
 /* ------------------------------ Employee / Branch ------------------------------ */
@@ -386,9 +412,9 @@ function attendanceIdExists_(attendanceId) {
   if (!attendanceId) return false;
 
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
-  const values = sheet.getDataRange().getValues();
+  const values = getAttendanceTailValues_(sheet, 1, 4, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
 
-  for (let i = values.length - 1; i >= 1; i -= 1) {
+  for (let i = values.length - 1; i >= 0; i -= 1) {
     if (String(values[i][0] || '').trim() === attendanceId) return true;
   }
 
@@ -397,13 +423,13 @@ function attendanceIdExists_(attendanceId) {
 
 function isConsecutiveDuplicate_(employeeId, status) {
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
-  const values = sheet.getDataRange().getValues();
+  const values = getAttendanceTailValues_(sheet, 2, 3, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
 
-  for (let i = values.length - 1; i >= 1; i -= 1) {
-    const rowEmployeeId = String(values[i][1] || '').trim();
+  for (let i = values.length - 1; i >= 0; i -= 1) {
+    const rowEmployeeId = String(values[i][0] || '').trim();
     if (rowEmployeeId !== employeeId) continue;
 
-    const lastStatus = String(values[i][3] || '').trim();
+    const lastStatus = String(values[i][2] || '').trim();
     return lastStatus === status;
   }
 

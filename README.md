@@ -51,7 +51,7 @@ This project implements a decoupled architecture:
 Important:
 - After every `Code.gs` change, create a **new Apps Script deployment version**.
 - Verify backend version quickly by opening your Apps Script URL in browser:
-  - Expected JSON field: `version: "1.2.1"`
+  - Expected JSON field: `version: "1.4.0"`
 
 ## 5) Usage
 
@@ -63,8 +63,8 @@ Important:
 5. Click `Saqlash`.
 
 Notes:
-- Save is optimistic: UI confirms immediately and resets.
-- Submission is queued and retried in background if network fails.
+- Save is server-confirmed: UI success appears only after backend acknowledges persistence.
+- If save fails, UI shows error and does not silently drop the entry.
 - Duplicate consecutive status is silently ignored by backend.
 
 ## 6) Step-by-Step Testing Checklist
@@ -96,12 +96,13 @@ Notes:
 5. Submit `Ketdim` before expected end -> early minutes should update.
 6. Confirm `monthly statistics` row updates/creates for current month/year.
 
-### E. Offline queue test
+### E. Save failure handling test
 
 1. Disconnect internet.
 2. Capture + Save attendance.
-3. Reconnect internet.
-4. Queue should auto-flush and row should appear in `attendance`.
+3. Confirm UI shows error (not success).
+4. Reconnect internet and save again.
+5. Confirm row is written after successful server response.
 
 ## 7) Operational Hardening Recommendations
 
@@ -110,6 +111,7 @@ Notes:
 3. Add a monitoring sheet or alert on backend exceptions.
 4. Archive old photo data to Drive when `attendance` size grows.
 5. Add Netlify deploy previews for release validation before production.
+6. For faster saves, keep Apps Script property `MONTHLY_RECALC_ON_WRITE=false` and run monthly rollup via scheduled job.
 
 ## 8) Common Issues
 
