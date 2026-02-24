@@ -210,21 +210,34 @@ img {
 }
 
 .message {
-  display: none;
+  display: block;
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-8px);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 9999;
+  width: min(92vw, 520px);
   border-radius: 10px;
-  margin: 10px 0 0;
+  margin: 0;
   padding: 10px;
   font-size: 13px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.message.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
 }
 
 .message.ok {
-  display: block;
   color: var(--success);
   background: var(--success-bg);
 }
 
 .message.err {
-  display: block;
   color: var(--danger);
   background: var(--danger-bg);
 }

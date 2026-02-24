@@ -11,8 +11,6 @@ const STATUS_META = Object.freeze({
   'Ishim bitdi': { icon: '↩' },
 });
 
-const QUEUE_KEY = 'attendance.queue.v1';
-
 const state = {
   employees: [],
   selectedEmployeeId: '',
@@ -20,6 +18,8 @@ const state = {
   capturedImageData: '',
   stream: null,
   cameraReady: false,
+  saveInFlight: false,
+  toastTimer: null,
 };
 
 const el = {
@@ -49,12 +49,6 @@ window.addEventListener('DOMContentLoaded', async () => {
   await loadBootstrap_(branch);
   await initCamera_({ fromUserGesture: false });
   updateActionState_();
-
-  void flushQueue_();
-});
-
-window.addEventListener('online', () => {
-  void flushQueue_();
 });
 
 function bindEvents_() {
@@ -103,7 +97,9 @@ function bindEvents_() {
     showMessage_('Rasm olindi.', 'ok');
   });
 
-  el.btnSave.addEventListener('click', () => {
+  el.btnSave.addEventListener('click', async () => {
+    if (state.saveInFlight) return;
+
     if (!state.selectedEmployeeId) {
       showMessage_('Xodimni tanlang.', 'err');
       return;
@@ -125,13 +121,29 @@ function bindEvents_() {
       capturedAt: new Date().toISOString(),
     };
 
-    enqueue_(request);
+    setSaveLoading_(true);
+    clearMessage_();
 
-    // Optimistic UI.
-    showMessage_('Muvaffaqiyatli saqlandi.', 'ok');
-    resetForm_();
+    try {
+      const result = await submitAttendanceRequest_(request);
+      if (!result.ok) {
+        showMessage_(result.error || 'Saqlashda xatolik yuz berdi. Qayta urinib ko‘ring.', 'err');
+        return;
+      }
 
-    void flushQueue_();
+      if (result.deduped && !result.wroteNewRow) {
+        showMessage_('Takror holat aniqlandi. Yangi qator qo‘shilmadi.', 'ok', { autoHideMs: 2000 });
+      } else {
+        showMessage_('Muvaffaqiyatli saqlandi.', 'ok', { autoHideMs: 2000 });
+      }
+
+      resetForm_();
+    } catch (err) {
+      console.error(err);
+      showMessage_('Serverga yuborilmadi. Tarmoqni tekshirib qayta urinib ko‘ring.', 'err');
+    } finally {
+      setSaveLoading_(false);
+    }
   });
 }
 
@@ -260,60 +272,42 @@ function resetForm_() {
   updateActionState_();
 }
 
-function enqueue_(entry) {
-  const queue = readQueue_();
-  queue.push(entry);
-  writeQueue_(queue);
-}
-
-async function flushQueue_() {
-  if (!navigator.onLine) return;
-
-  const queue = readQueue_();
-  if (queue.length === 0) return;
-
-  const failed = [];
-
-  for (const item of queue) {
-    try {
-      const res = await fetch(API.attendance, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(item),
-      });
-
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        failed.push(item);
-      } else {
-        // Useful for production diagnostics to confirm backend version and Drive path storage.
-        if (data.apiVersion) {
-          console.info('Attendance accepted by API version:', data.apiVersion, 'imagePath:', data.imagePath || '');
-        }
-      }
-    } catch (_err) {
-      failed.push(item);
-    }
-  }
-
-  writeQueue_(failed);
-
-  if (failed.length > 0) {
-    showMessage_(`Sinxronlash navbatida: ${failed.length} ta yozuv. Tarmoq/yoki serverni tekshiring.`, 'err');
-  }
-}
-
-function readQueue_() {
+async function submitAttendanceRequest_(request) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 25000);
+  let res;
   try {
-    const parsed = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_err) {
-    return [];
+    res = await fetch(API.attendance, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
   }
+
+  let data = {};
+  try {
+    data = await res.json();
+  } catch (_parseErr) {
+    data = { ok: false, error: 'Serverdan noto‘g‘ri javob qaytdi.' };
+  }
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: data.error || `HTTP ${res.status} xatolik`,
+    };
+  }
+
+  return data;
 }
 
-function writeQueue_(queue) {
-  localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+function setSaveLoading_(isLoading) {
+  state.saveInFlight = isLoading;
+  el.btnSave.textContent = isLoading ? 'Saqlanmoqda...' : 'Saqlash';
+  updateActionState_();
 }
 
 function registerServiceWorker_() {
@@ -353,12 +347,28 @@ function hideCameraHint_() {
   el.cameraHint.style.display = 'none';
 }
 
-function showMessage_(text, type) {
-  el.message.className = `message ${type}`;
+function showMessage_(text, type, options = {}) {
+  if (state.toastTimer) {
+    clearTimeout(state.toastTimer);
+    state.toastTimer = null;
+  }
+
+  const autoHideMs = Number(options.autoHideMs || 0);
+  el.message.className = `message ${type} show`;
   el.message.textContent = text;
+
+  if (autoHideMs > 0) {
+    state.toastTimer = setTimeout(() => {
+      clearMessage_();
+    }, autoHideMs);
+  }
 }
 
 function clearMessage_() {
+  if (state.toastTimer) {
+    clearTimeout(state.toastTimer);
+    state.toastTimer = null;
+  }
   el.message.className = 'message';
   el.message.textContent = '';
 }
@@ -385,7 +395,8 @@ function updateActionState_() {
   const hasPhoto = Boolean(state.capturedImageData);
 
   // Save is enabled only when payload is complete.
-  el.btnSave.disabled = !(hasEmployee && hasStatus && hasPhoto);
+  el.btnSave.disabled = !(hasEmployee && hasStatus && hasPhoto) || state.saveInFlight;
+  el.btnCapture.disabled = state.saveInFlight;
 
   // Capture button doubles as retake action after first shot.
   if (hasPhoto) {
