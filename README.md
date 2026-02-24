@@ -1,137 +1,108 @@
-# Enterprise Decoupled PWA Attendance (Netlify + Apps Script)
+# Attendance System (Decoupled Apps Script Architecture)
 
-This project implements a decoupled architecture:
+This version is optimized for reliability and speed:
 
-1. `web/` is a PWA frontend (Netlify static hosting).
-2. `netlify/functions/gas-proxy.js` is a backend-for-frontend (BFF) proxy.
-3. `Code.gs` is the Apps Script backend (Sheets writes + calculations).
+1. API write path saves only to `attendance` (fast).
+2. Daily statistics are updated by a background worker.
+3. Monthly statistics are updated by a nightly worker.
 
-## 1) Architecture
-
-- Browser never calls Apps Script directly.
-- Browser calls `/api/bootstrap` and `/api/attendance` on the same Netlify domain.
-- Netlify Function forwards requests to Apps Script with `API_SHARED_SECRET`.
-- Apps Script validates secret, performs dedupe/idempotency, writes attendance, recalculates daily/monthly statistics.
-
-## 2) Folder Structure
+## Files
 
 - `/Users/macbookair13/Documents/appscript based attendance form/Code.gs`
 - `/Users/macbookair13/Documents/appscript based attendance form/netlify/functions/gas-proxy.js`
 - `/Users/macbookair13/Documents/appscript based attendance form/netlify.toml`
-- `/Users/macbookair13/Documents/appscript based attendance form/web/index.html`
-- `/Users/macbookair13/Documents/appscript based attendance form/web/assets/app.js`
-- `/Users/macbookair13/Documents/appscript based attendance form/web/assets/styles.css`
-- `/Users/macbookair13/Documents/appscript based attendance form/web/sw.js`
-- `/Users/macbookair13/Documents/appscript based attendance form/web/manifest.webmanifest`
+- `/Users/macbookair13/Documents/appscript based attendance form/web/` (PWA frontend)
 
-## 3) Apps Script Setup (Backend)
+## Required Spreadsheet Sheets
 
-1. Create a new Apps Script project.
-2. Paste the content of `/Users/macbookair13/Documents/appscript based attendance form/Code.gs`.
-3. Open **Project Settings** -> **Script properties** and set:
-- `SPREADSHEET_ID` = your Google Spreadsheet ID
-- `API_SHARED_SECRET` = long random secret (same value used in Netlify env)
-4. Deploy as **Web app**:
+1. `xodimlar`
+2. `attendance`
+3. `statistika`
+4. `monthly statistics`
+
+## 1) Apps Script Setup
+
+1. Open your Apps Script project.
+2. Replace code with `/Users/macbookair13/Documents/appscript based attendance form/Code.gs`.
+3. In **Project Settings -> Script properties**, set:
+- `SPREADSHEET_ID` = production spreadsheet id
+- `API_SHARED_SECRET` = long random secret
+4. Deploy Web App:
 - Execute as: `Me`
-- Who has access: `Anyone`
-5. Copy deployment URL (example: `https://script.google.com/macros/s/.../exec`).
+- Access: `Anyone`
+5. Open web app URL and verify JSON has:
+- `"version":"2.0.0"`
 
-## 4) Netlify Setup (Frontend + Proxy)
+## 2) Netlify Setup
 
-1. Push this folder to GitHub.
-2. Create Netlify site from the repo.
-3. Netlify detects `netlify.toml`:
-- Publish directory: `web`
-- Functions directory: `netlify/functions`
-4. In Netlify -> **Site configuration** -> **Environment variables**, add:
+In Netlify environment variables:
+
 - `GAS_WEB_APP_URL` = Apps Script web app URL
 - `GAS_SHARED_SECRET` = same value as Apps Script `API_SHARED_SECRET`
-5. Trigger redeploy.
 
-Important:
-- After every `Code.gs` change, create a **new Apps Script deployment version**.
-- Verify backend version quickly by opening your Apps Script URL in browser:
-  - Expected JSON field: `version: "1.4.0"`
+Trigger redeploy.
 
-## 5) Usage
+## 3) Worker Trigger Setup (Important)
 
-1. Open your Netlify URL with branch parameter, for example:
-- `https://your-site.netlify.app/?branch=Фарғона`
-2. Select employee.
-3. Select status (`Keldim`, `Ketdim`, `Ishim bor`, `Ishim bitdi`).
-4. Click `Rasmga Olish`.
-5. Click `Saqlash`.
+Create **installable triggers** in Apps Script:
 
-Notes:
-- Save is server-confirmed: UI success appears only after backend acknowledges persistence.
-- If save fails, UI shows error and does not silently drop the entry.
-- Duplicate consecutive status is silently ignored by backend.
+1. Daily incremental worker
+- Function: `processAttendanceToDailyStats`
+- Event type: Time-driven
+- Frequency: Every 1 minute (or 5 minutes)
 
-## 6) Step-by-Step Testing Checklist
+2. Nightly monthly rollup
+- Function: `runNightlyMonthlyRollup`
+- Event type: Time-driven
+- Frequency: Daily
+- Time: night (e.g., 23:00-23:59)
 
-### A. Bootstrap/branch test
+## 4) First-Time Worker Initialization
 
-1. Open `https://your-site.netlify.app/?branch=Фарғона`.
-2. Confirm only active employees of `Фарғона` appear.
-3. Confirm employees with `status != faol` are excluded.
+If you want worker to start from current attendance row and skip old historical rows:
 
-### B. Camera test
+1. Run function: `initializeAttendanceCursorToCurrentLastRow`
+2. Accept permissions.
 
-1. Open in Chrome on Windows laptop.
-2. Confirm camera permission prompt appears (if first time).
-3. If not auto-started, click `Rasmga Olish` and confirm camera starts via user gesture fallback.
-4. Capture should replace live view in same frame.
+If you want to process all history, do not run this initializer.
 
-### C. Attendance write + dedupe
+## 5) Runtime Flow
 
-1. Submit `Keldim` once -> attendance row should be written.
-2. Submit `Keldim` again immediately for same employee -> UI success but no extra raw row should be added.
+1. Frontend calls `/api/attendance`.
+2. Apps Script validates, dedupes, stores image to Drive path, writes one row to `attendance`.
+3. `processAttendanceToDailyStats` updates `statistika` asynchronously.
+4. `runNightlyMonthlyRollup` updates `monthly statistics` once per night.
 
-### D. Statistics calculation
+## 6) API Behavior Guarantees
 
-1. `Keldim` after expected start -> `statistika.late time` > 0.
-2. Verify penalty formula: `(soatbay ish xaqi / 60) * late minutes`.
-3. Verify `today salary = kunlik ish xaqi - penalty`.
-4. Submit `Ishim bor` then `Ishim bitdi` -> outwork minutes should update.
-5. Submit `Ketdim` before expected end -> early minutes should update.
-6. Confirm `monthly statistics` row updates/creates for current month/year.
+1. Success is returned only when attendance write is persisted.
+2. Duplicate consecutive status is silently ignored (dedupe).
+3. `requestId` retries are idempotent.
+4. If image upload fails, attendance still writes with fallback path format.
 
-### E. Save failure handling test
+## 7) Testing Checklist
 
-1. Disconnect internet.
-2. Capture + Save attendance.
-3. Confirm UI shows error (not success).
-4. Reconnect internet and save again.
-5. Confirm row is written after successful server response.
+1. Open app URL with branch:
+- `https://attendance-uz.netlify.app/?branch=Фарғона`
+2. Save one record and confirm new row in `attendance` immediately.
+3. Wait for daily worker trigger and confirm row updates in `statistika`.
+4. Run `runNightlyMonthlyRollup` manually once and verify `monthly statistics`.
+5. Retry same requestId (or duplicate same status) and verify no duplicate row write.
 
-## 7) Operational Hardening Recommendations
+## 8) Troubleshooting
 
-1. Rotate `API_SHARED_SECRET` quarterly.
-2. Restrict Netlify function abuse with rate limiting (if traffic grows).
-3. Add a monitoring sheet or alert on backend exceptions.
-4. Archive old photo data to Drive when `attendance` size grows.
-5. Add Netlify deploy previews for release validation before production.
-6. For faster saves, keep Apps Script property `MONTHLY_RECALC_ON_WRITE=false` and run monthly rollup via scheduled job.
+1. Empty employee list:
+- wrong `SPREADSHEET_ID`
+- wrong branch value
+- old Apps Script deployment version
 
-## 8) Common Issues
+2. Unauthorized:
+- `GAS_SHARED_SECRET` != `API_SHARED_SECRET`
 
-1. Empty employee dropdown:
-- Wrong `SPREADSHEET_ID`
-- Wrong branch value in URL
-- Branch naming mismatch in sheet
-- Old Apps Script deployment still active (new code not deployed)
+3. Slow save:
+- check network/upload speed
+- ensure workers are not called in save path
 
-2. Unauthorized backend response:
-- `GAS_SHARED_SECRET` and `API_SHARED_SECRET` mismatch
-
-3. Camera blocked:
-- Site permissions blocked in browser settings
-- Non-HTTPS URL
-- Laptop camera in use by another application
-
-4. Custom logo in installed PWA:
-- Replace `/Users/macbookair13/Documents/appscript based attendance form/web/assets/logo.png` with your own logo.
-- Installed PWA icon files are:
-  - `/Users/macbookair13/Documents/appscript based attendance form/web/assets/icon-192.png`
-  - `/Users/macbookair13/Documents/appscript based attendance form/web/assets/icon-512.png`
-- Redeploy Netlify, then uninstall/reinstall the PWA to refresh icon cache.
+4. No daily/monthly updates:
+- missing installable triggers
+- worker permissions not granted

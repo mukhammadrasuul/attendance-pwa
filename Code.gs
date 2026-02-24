@@ -1,16 +1,24 @@
 /**
- * Enterprise-grade decoupled backend for Attendance PWA.
+ * Attendance API + Workers (Decoupled Architecture)
  *
- * Usage:
- * - Deploy as Apps Script Web App.
- * - Call via POST JSON from Netlify Function (recommended), not directly from browser.
+ * API (user-facing):
+ * - bootstrap: branch-filtered employee list
+ * - submitAttendance: validates + dedupes + writes attendance only
+ *
+ * Workers (time-driven):
+ * - processAttendanceToDailyStats: incremental daily statistics updater
+ * - runNightlyMonthlyRollup: monthly aggregation updater (nightly)
  *
  * Required Script Properties:
- * - SPREADSHEET_ID: target spreadsheet id
- * - API_SHARED_SECRET: shared secret expected from proxy
+ * - SPREADSHEET_ID
+ * - API_SHARED_SECRET
+ *
+ * Optional Script Properties:
+ * - ATT_LAST_PROCESSED_ROW (managed automatically)
  */
 
 const CONFIG = Object.freeze({
+  VERSION: '2.0.0',
   SHEETS: Object.freeze({
     EMPLOYEES: 'xodimlar',
     ATTENDANCE: 'attendance',
@@ -25,13 +33,14 @@ const CONFIG = Object.freeze({
   }),
   DRIVE: Object.freeze({
     ATTENDANCE_FOLDER_ID: '1kiqoaAJDx3967MzfcsgQVNCFggQ2aPSV',
+    ATTENDANCE_FOLDER_NAME: 'attendance_Images',
   }),
   PERF: Object.freeze({
-    // Scan only recent rows for idempotency + duplicate checks (fast and sufficient for retry windows).
     ATTENDANCE_LOOKBACK_ROWS: 1500,
-    // Monthly rollup is expensive on each write. Keep it off for low-latency saves.
-    // Set script property MONTHLY_RECALC_ON_WRITE=true if immediate monthly updates are required.
-    MONTHLY_RECALC_ON_WRITE: getBooleanProperty_('MONTHLY_RECALC_ON_WRITE', false),
+    DAILY_WORKER_BATCH_SIZE: 300,
+  }),
+  PROPS: Object.freeze({
+    ATT_LAST_PROCESSED_ROW: 'ATT_LAST_PROCESSED_ROW',
   }),
   TIMEZONE: Session.getScriptTimeZone() || 'Asia/Tashkent',
 });
@@ -42,7 +51,7 @@ function doGet() {
   return jsonResponse_({
     ok: true,
     service: 'attendance-api',
-    version: '1.4.0',
+    version: CONFIG.VERSION,
     now: new Date().toISOString(),
   });
 }
@@ -56,20 +65,21 @@ function doPost(e) {
     if (!action) throw httpError_(400, 'Missing action');
 
     if (action === 'bootstrap') {
-      const branch = String(body.branch || '').trim();
-      return jsonResponse_(buildBootstrap_(branch));
+      return jsonResponse_(buildBootstrap_(String(body.branch || '').trim()));
     }
 
     if (action === 'submitAttendance') {
-      const result = submitAttendance_(body.payload || {});
-      return jsonResponse_(result);
+      return jsonResponse_(submitAttendance_(body.payload || {}));
     }
 
     throw httpError_(400, `Unsupported action: ${action}`);
   } catch (err) {
     console.error(err);
-    const status = err && err.httpStatus ? err.httpStatus : 500;
-    return jsonResponse_({ ok: false, error: err.message || 'Server error', status });
+    return jsonResponse_({
+      ok: false,
+      error: err.message || 'Server error',
+      status: err.httpStatus || 500,
+    });
   }
 }
 
@@ -77,6 +87,7 @@ function doPost(e) {
 
 function buildBootstrap_(branch) {
   const employees = getActiveEmployeesByBranch_(branch);
+
   return {
     ok: true,
     branch,
@@ -87,21 +98,23 @@ function buildBootstrap_(branch) {
       CONFIG.STATUS.OUT_START,
       CONFIG.STATUS.OUT_END,
     ],
-    apiVersion: '1.4.0',
+    apiVersion: CONFIG.VERSION,
     employeeCount: employees.length,
     serverTime: new Date().toISOString(),
   };
 }
 
+/**
+ * User-facing write path: keep this fast and reliable.
+ * Writes attendance row only (plus image path), without heavy calculations.
+ */
 function submitAttendance_(payload) {
   const lock = LockService.getDocumentLock();
   lock.waitLock(30000);
 
   try {
     const data = validateSubmission_(payload);
-    const now = new Date();
 
-    // Idempotency guarantee for retried client submissions.
     if (data.requestId && attendanceIdExists_(data.requestId)) {
       return {
         ok: true,
@@ -109,11 +122,10 @@ function submitAttendance_(payload) {
         wroteNewRow: false,
         deduped: true,
         idempotent: true,
-        apiVersion: '1.4.0',
+        apiVersion: CONFIG.VERSION,
       };
     }
 
-    // Business dedupe: same employee + same status consecutively ignored.
     if (isConsecutiveDuplicate_(data.employeeId, data.status)) {
       return {
         ok: true,
@@ -121,42 +133,21 @@ function submitAttendance_(payload) {
         wroteNewRow: false,
         deduped: true,
         idempotent: false,
-        apiVersion: '1.4.0',
+        apiVersion: CONFIG.VERSION,
       };
     }
 
-    let imagePath = '';
-    const warnings = [];
-    try {
-      imagePath = saveAttendanceImageToDrive_(data.imageData, data.requestId);
-    } catch (uploadErr) {
-      // Never block attendance logging on image upload failures.
-      // Keep a deterministic placeholder path for traceability/recovery jobs.
-      const fallbackName = makeAttendanceImageFileName_(data.requestId, 'jpg');
-      imagePath = `attendance_Images/${fallbackName}`;
-      const uploadWarning = `Image upload failed: ${uploadErr.message}`;
-      warnings.push(uploadWarning);
-      console.error(uploadWarning);
-    }
+    const now = new Date();
+    const attendanceId = data.requestId || Utilities.getUuid();
+    const imagePath = storeAttendanceImagePath_(data.imageData, attendanceId);
 
     appendAttendanceRow_({
-      attendanceId: data.requestId || Utilities.getUuid(),
+      attendanceId,
       employeeId: data.employeeId,
       datetime: now,
       status: data.status,
       imagePath,
     });
-
-    try {
-      recalcDailyStatForEmployeeDate_(data.employeeId, now);
-      if (CONFIG.PERF.MONTHLY_RECALC_ON_WRITE) {
-        recalcMonthlyStatForEmployeeMonth_(data.employeeId, now);
-      }
-    } catch (statsErr) {
-      const statsWarning = `Attendance saved, but statistics update failed: ${statsErr.message}`;
-      warnings.push(statsWarning);
-      console.error(statsWarning);
-    }
 
     return {
       ok: true,
@@ -165,12 +156,187 @@ function submitAttendance_(payload) {
       deduped: false,
       idempotent: false,
       imagePath,
-      warning: warnings.join(' | '),
-      apiVersion: '1.4.0',
+      apiVersion: CONFIG.VERSION,
     };
   } finally {
     lock.releaseLock();
   }
+}
+
+/* ------------------------------ Workers ------------------------------ */
+
+/**
+ * Incremental worker: process new rows from attendance and upsert daily stats.
+ * Recommended trigger: every 1-5 minutes.
+ */
+function processAttendanceToDailyStats(batchSize) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+
+  try {
+    const attendanceSheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+    const lastRow = attendanceSheet.getLastRow();
+    if (lastRow <= 1) {
+      return { ok: true, processedRows: 0, impactedDays: 0, updatedDailyRows: 0, insertedDailyRows: 0 };
+    }
+
+    const safeBatchSize = Math.max(1, Number(batchSize) || CONFIG.PERF.DAILY_WORKER_BATCH_SIZE);
+    const lastProcessed = getNumericProperty_(CONFIG.PROPS.ATT_LAST_PROCESSED_ROW, 1);
+
+    if (lastProcessed >= lastRow) {
+      return { ok: true, processedRows: 0, impactedDays: 0, updatedDailyRows: 0, insertedDailyRows: 0 };
+    }
+
+    const startRow = lastProcessed + 1;
+    const endRow = Math.min(lastRow, startRow + safeBatchSize - 1);
+    const numRows = endRow - startRow + 1;
+
+    // attendance cols used here: employee id (2), datetime (3), status (4)
+    const chunk = attendanceSheet.getRange(startRow, 2, numRows, 3).getValues();
+
+    const impacted = new Map();
+    const employeeIds = new Set();
+
+    chunk.forEach((row) => {
+      const employeeId = String(row[0] || '').trim();
+      const datetime = asDate_(row[1]);
+      if (!employeeId || !datetime) return;
+
+      const day = stripTime_(datetime);
+      const key = employeeDateKey_(employeeId, day);
+
+      if (!impacted.has(key)) impacted.set(key, { employeeId, day });
+      employeeIds.add(employeeId);
+    });
+
+    // Advance cursor even if rows were malformed, to avoid worker stall.
+    if (impacted.size === 0) {
+      setNumericProperty_(CONFIG.PROPS.ATT_LAST_PROCESSED_ROW, endRow);
+      return { ok: true, processedRows: numRows, impactedDays: 0, updatedDailyRows: 0, insertedDailyRows: 0 };
+    }
+
+    const employeeMap = getEmployeeMapByIds_(employeeIds);
+    const logsByKey = getAttendanceLogsByKeys_(new Set(impacted.keys()));
+
+    const dailyEntries = [];
+    let skippedNoEmployee = 0;
+
+    impacted.forEach((entry, key) => {
+      const employee = employeeMap.get(entry.employeeId);
+      if (!employee) {
+        skippedNoEmployee += 1;
+        return;
+      }
+
+      const logs = (logsByKey.get(key) || []).sort((a, b) => a.datetime.getTime() - b.datetime.getTime());
+      const metrics = computeDailyMetrics_(employee, entry.day, logs);
+
+      dailyEntries.push({
+        employeeId: entry.employeeId,
+        date: entry.day,
+        lateMinutes: metrics.lateMinutes,
+        earlyMinutes: metrics.earlyMinutes,
+        outworkMinutes: metrics.outworkMinutes,
+        penalty: metrics.penalty,
+        todaySalary: metrics.todaySalary,
+      });
+    });
+
+    const upsert = upsertDailyEntries_(dailyEntries);
+
+    setNumericProperty_(CONFIG.PROPS.ATT_LAST_PROCESSED_ROW, endRow);
+
+    return {
+      ok: true,
+      processedRows: numRows,
+      impactedDays: impacted.size,
+      skippedNoEmployee,
+      updatedDailyRows: upsert.updated,
+      insertedDailyRows: upsert.inserted,
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Nightly worker: rebuilds monthly statistics for target month/year.
+ * Recommended trigger: once daily at night.
+ */
+function runNightlyMonthlyRollup(targetMonth, targetYear) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+
+  try {
+    const now = new Date();
+    const month = Number(targetMonth) || (now.getMonth() + 1);
+    const year = Number(targetYear) || now.getFullYear();
+
+    const dailyRows = getDailyRowsForMonth_(month, year);
+    const attendanceRows = getAttendanceRowsForMonth_(month, year);
+
+    const dailyAgg = aggregateDailyByEmployee_(dailyRows);
+    const attAgg = aggregateAttendanceByEmployee_(attendanceRows);
+
+    const employeeIds = new Set([...dailyAgg.keys(), ...attAgg.keys()]);
+    const monthlyEntries = [];
+
+    employeeIds.forEach((employeeId) => {
+      const d = dailyAgg.get(employeeId) || {
+        lateCount: 0,
+        overallLateHrs: 0,
+        earlyCount: 0,
+        overallEarlyHrs: 0,
+        overallOutworkHrs: 0,
+        totalPenalty: 0,
+        salary: 0,
+      };
+
+      const a = attAgg.get(employeeId) || {
+        workedDays: 0,
+        outworkCount: 0,
+      };
+
+      monthlyEntries.push({
+        employeeId,
+        month,
+        year,
+        workedDays: a.workedDays,
+        lateCount: d.lateCount,
+        overallLateHrs: d.overallLateHrs,
+        earlyCount: d.earlyCount,
+        overallEarlyHrs: d.overallEarlyHrs,
+        outworkCount: a.outworkCount,
+        overallOutworkHrs: d.overallOutworkHrs,
+        totalPenalty: round2_(d.totalPenalty),
+        salary: round2_(d.salary),
+      });
+    });
+
+    const upsert = upsertMonthlyEntries_(monthlyEntries, month, year);
+
+    return {
+      ok: true,
+      month,
+      year,
+      employees: monthlyEntries.length,
+      updatedMonthlyRows: upsert.updated,
+      insertedMonthlyRows: upsert.inserted,
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Helper for first deployment: initialize attendance cursor to current last row.
+ * Use once if you want workers to start from "now" and skip historical rows.
+ */
+function initializeAttendanceCursorToCurrentLastRow() {
+  const attendanceSheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+  const lastRow = attendanceSheet.getLastRow();
+  setNumericProperty_(CONFIG.PROPS.ATT_LAST_PROCESSED_ROW, Math.max(1, lastRow));
+  return { ok: true, cursor: Math.max(1, lastRow) };
 }
 
 /* ------------------------------ Validation / Auth ------------------------------ */
@@ -211,28 +377,22 @@ function getSpreadsheet_() {
   const rawRef = getRequiredProperty_('SPREADSHEET_ID').trim();
   const spreadsheetId = extractSpreadsheetId_(rawRef);
 
-  // 1) If full URL is provided, try URL first.
   if (/^https?:\/\//i.test(rawRef)) {
     try {
       return SpreadsheetApp.openByUrl(rawRef);
     } catch (_errByUrl) {
-      // fall through to id-based open
+      // fallback below
     }
   }
 
-  // 2) ID-based open.
   try {
     return SpreadsheetApp.openById(spreadsheetId);
   } catch (_errById) {
-    // 3) DriveApp fallback avoids some intermittent openById runtime issues.
     try {
       const file = DriveApp.getFileById(spreadsheetId);
       return SpreadsheetApp.open(file);
     } catch (errByDrive) {
-      throw httpError_(
-        500,
-        `Unable to open spreadsheet from SPREADSHEET_ID. Check property value, share permissions, and deployment auth. Detail: ${errByDrive.message}`
-      );
+      throw httpError_(500, `Unable to open spreadsheet. Detail: ${errByDrive.message}`);
     }
   }
 }
@@ -249,34 +409,25 @@ function getRequiredProperty_(name) {
   return value;
 }
 
-function getBooleanProperty_(name, defaultValue) {
-  const value = PropertiesService.getScriptProperties().getProperty(name);
-  if (value === null || value === undefined || value === '') return Boolean(defaultValue);
-  const normalized = String(value).trim().toLowerCase();
-  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+function getNumericProperty_(name, defaultValue) {
+  const raw = PropertiesService.getScriptProperties().getProperty(name);
+  if (raw === null || raw === undefined || raw === '') return Number(defaultValue);
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : Number(defaultValue);
+}
+
+function setNumericProperty_(name, value) {
+  PropertiesService.getScriptProperties().setProperty(name, String(Number(value) || 0));
 }
 
 function extractSpreadsheetId_(rawRef) {
   const ref = String(rawRef || '').trim();
   if (!ref) throw httpError_(500, 'SPREADSHEET_ID is empty');
 
-  // Accept either:
-  // 1) Plain spreadsheet id
-  // 2) Full spreadsheet URL
   const urlMatch = ref.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
   if (urlMatch && urlMatch[1]) return urlMatch[1];
 
   return ref;
-}
-
-function getAttendanceTailValues_(sheet, startCol, numCols, lookbackRows) {
-  const lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return [];
-
-  const dataRows = lastRow - 1;
-  const rowsToRead = Math.min(dataRows, Math.max(1, Number(lookbackRows) || 1000));
-  const startRow = lastRow - rowsToRead + 1;
-  return sheet.getRange(startRow, startCol, rowsToRead, numCols).getValues();
 }
 
 /* ------------------------------ Employee / Branch ------------------------------ */
@@ -308,6 +459,29 @@ function getActiveEmployeesByBranch_(branchParam) {
       fullName: `${emp.name} ${emp.surname}`.trim(),
       branch: emp.branch,
     }));
+}
+
+function getEmployeeMapByIds_(employeeIds) {
+  const sheet = getSheetOrThrow_(CONFIG.SHEETS.EMPLOYEES);
+  const values = sheet.getDataRange().getValues();
+
+  const map = new Map();
+  const idSet = new Set(Array.from(employeeIds || []).map((id) => String(id || '').trim()).filter(Boolean));
+
+  values.slice(1).forEach((row) => {
+    const id = String(row[0] || '').trim();
+    if (!id || !idSet.has(id)) return;
+
+    map.set(id, {
+      id,
+      dailySalary: toNumber_(row[4]),
+      hourlySalary: toNumber_(row[5]),
+      expectedStartRaw: row[6],
+      expectedEndRaw: row[7],
+    });
+  });
+
+  return map;
 }
 
 function branchKey_(input) {
@@ -350,10 +524,57 @@ function appendAttendanceRow_(row) {
   ]);
 }
 
-/**
- * Saves data-url image into target Drive folder and returns sheet path value.
- * Example output: attendance_Images/bb7c88eb.1770876524190.jpg
- */
+function attendanceIdExists_(attendanceId) {
+  if (!attendanceId) return false;
+
+  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+  const values = getAttendanceTailValues_(sheet, 1, 1, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
+
+  for (let i = values.length - 1; i >= 0; i -= 1) {
+    if (String(values[i][0] || '').trim() === attendanceId) return true;
+  }
+
+  return false;
+}
+
+function isConsecutiveDuplicate_(employeeId, status) {
+  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+  // cols: employee id (2), datetime (3), status (4)
+  const values = getAttendanceTailValues_(sheet, 2, 3, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
+
+  for (let i = values.length - 1; i >= 0; i -= 1) {
+    const rowEmployeeId = String(values[i][0] || '').trim();
+    if (rowEmployeeId !== employeeId) continue;
+
+    const lastStatus = String(values[i][2] || '').trim();
+    return lastStatus === status;
+  }
+
+  return false;
+}
+
+function getAttendanceTailValues_(sheet, startCol, numCols, lookbackRows) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return [];
+
+  const dataRows = lastRow - 1;
+  const rowsToRead = Math.min(dataRows, Math.max(1, Number(lookbackRows) || 1000));
+  const startRow = lastRow - rowsToRead + 1;
+  return sheet.getRange(startRow, startCol, rowsToRead, numCols).getValues();
+}
+
+/* ------------------------------ Image Storage ------------------------------ */
+
+function storeAttendanceImagePath_(imageDataUrl, requestId) {
+  try {
+    return saveAttendanceImageToDrive_(imageDataUrl, requestId);
+  } catch (err) {
+    // Keep attendance write reliable even when Drive upload fails.
+    console.error(`Image upload failed, fallback path used: ${err.message}`);
+    return `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(requestId, 'jpg')}`;
+  }
+}
+
 function saveAttendanceImageToDrive_(imageDataUrl, requestId) {
   const parsed = parseDataUrlImage_(imageDataUrl);
   const folder = getAttendanceImageFolder_();
@@ -364,8 +585,7 @@ function saveAttendanceImageToDrive_(imageDataUrl, requestId) {
   const blob = Utilities.newBlob(bytes, parsed.mimeType, fileName);
   const file = folder.createFile(blob);
 
-  // Keep a stable, integration-friendly path format in sheet.
-  return `attendance_Images/${file.getName()}`;
+  return `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${file.getName()}`;
 }
 
 function parseDataUrlImage_(dataUrl) {
@@ -373,10 +593,7 @@ function parseDataUrlImage_(dataUrl) {
   const match = raw.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
   if (!match) throw httpError_(400, 'Invalid image data URL format');
 
-  return {
-    mimeType: match[1],
-    base64Data: match[2],
-  };
+  return { mimeType: match[1], base64Data: match[2] };
 }
 
 function extensionFromMimeType_(mimeType) {
@@ -397,89 +614,39 @@ function makeAttendanceImageFileName_(requestId, ext) {
 }
 
 function getAttendanceImageFolder_() {
-  const folderId = CONFIG.DRIVE.ATTENDANCE_FOLDER_ID;
   try {
-    return DriveApp.getFolderById(folderId);
+    return DriveApp.getFolderById(CONFIG.DRIVE.ATTENDANCE_FOLDER_ID);
   } catch (err) {
-    throw httpError_(
-      500,
-      `Attendance image folder is not accessible. Verify folder ID and script permissions. Detail: ${err.message}`
-    );
+    throw httpError_(500, `Attendance image folder is not accessible. Detail: ${err.message}`);
   }
 }
 
-function attendanceIdExists_(attendanceId) {
-  if (!attendanceId) return false;
+/* ------------------------------ Daily Stats Worker ------------------------------ */
 
+function getAttendanceLogsByKeys_(keySet) {
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
-  const values = getAttendanceTailValues_(sheet, 1, 4, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1 || keySet.size === 0) return new Map();
 
-  for (let i = values.length - 1; i >= 0; i -= 1) {
-    if (String(values[i][0] || '').trim() === attendanceId) return true;
-  }
+  // cols: employee id (2), datetime (3), status (4)
+  const values = sheet.getRange(2, 2, lastRow - 1, 3).getValues();
+  const map = new Map();
 
-  return false;
-}
+  values.forEach((row) => {
+    const employeeId = String(row[0] || '').trim();
+    const datetime = asDate_(row[1]);
+    const status = String(row[2] || '').trim();
+    if (!employeeId || !datetime || !status) return;
 
-function isConsecutiveDuplicate_(employeeId, status) {
-  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
-  const values = getAttendanceTailValues_(sheet, 2, 3, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
+    const day = stripTime_(datetime);
+    const key = employeeDateKey_(employeeId, day);
+    if (!keySet.has(key)) return;
 
-  for (let i = values.length - 1; i >= 0; i -= 1) {
-    const rowEmployeeId = String(values[i][0] || '').trim();
-    if (rowEmployeeId !== employeeId) continue;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push({ employeeId, datetime, status });
+  });
 
-    const lastStatus = String(values[i][2] || '').trim();
-    return lastStatus === status;
-  }
-
-  return false;
-}
-
-/* ------------------------------ Daily Statistics ------------------------------ */
-
-function recalcDailyStatForEmployeeDate_(employeeId, dateTime) {
-  const employee = getEmployeeById_(employeeId);
-  const logs = getEmployeeLogsForDate_(employeeId, dateTime);
-  const metrics = computeDailyMetrics_(employee, dateTime, logs);
-  upsertDailyRow_(employeeId, dateTime, metrics);
-}
-
-function getEmployeeById_(employeeId) {
-  const sheet = getSheetOrThrow_(CONFIG.SHEETS.EMPLOYEES);
-  const values = sheet.getDataRange().getValues();
-
-  for (let i = 1; i < values.length; i += 1) {
-    const row = values[i];
-    if (String(row[0] || '').trim() === employeeId) {
-      return {
-        id: employeeId,
-        dailySalary: toNumber_(row[4]),
-        hourlySalary: toNumber_(row[5]),
-        expectedStartRaw: row[6],
-        expectedEndRaw: row[7],
-      };
-    }
-  }
-
-  throw httpError_(404, `Employee not found: ${employeeId}`);
-}
-
-function getEmployeeLogsForDate_(employeeId, dateTime) {
-  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
-  const values = sheet.getDataRange().getValues();
-  const dateKey = formatDateKey_(dateTime);
-
-  return values
-    .slice(1)
-    .map((row) => ({
-      employeeId: String(row[1] || '').trim(),
-      datetime: asDate_(row[2]),
-      status: String(row[3] || '').trim(),
-    }))
-    .filter((r) => r.employeeId === employeeId && r.datetime)
-    .filter((r) => formatDateKey_(r.datetime) === dateKey)
-    .sort((a, b) => a.datetime.getTime() - b.datetime.getTime());
+  return map;
 }
 
 function computeDailyMetrics_(employee, dateTime, logs) {
@@ -525,95 +692,57 @@ function pairAndSumOutworkMinutes_(outStarts, outEnds) {
   return Math.max(0, total);
 }
 
-function upsertDailyRow_(employeeId, dateTime, metrics) {
+function upsertDailyEntries_(entries) {
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.DAILY);
   const values = sheet.getDataRange().getValues();
-  const dateKey = formatDateKey_(dateTime);
 
-  let foundRow = -1;
+  const existing = new Map();
   for (let i = 1; i < values.length; i += 1) {
-    const rowEmployeeId = String(values[i][1] || '').trim();
-    const rowDate = asDate_(values[i][2]);
-    if (!rowDate) continue;
+    const rowId = String(values[i][0] || '').trim();
+    const employeeId = String(values[i][1] || '').trim();
+    const date = asDate_(values[i][2]);
+    if (!employeeId || !date) continue;
 
-    if (rowEmployeeId === employeeId && formatDateKey_(rowDate) === dateKey) {
-      foundRow = i + 1;
-      break;
+    const key = employeeDateKey_(employeeId, date);
+    existing.set(key, { rowNumber: i + 1, rowId });
+  }
+
+  const toAppend = [];
+  let updated = 0;
+
+  entries.forEach((entry) => {
+    const key = employeeDateKey_(entry.employeeId, entry.date);
+    const found = existing.get(key);
+    const rowValues = [
+      found && found.rowId ? found.rowId : Utilities.getUuid(),
+      entry.employeeId,
+      stripTime_(entry.date),
+      entry.lateMinutes,
+      entry.earlyMinutes,
+      entry.outworkMinutes,
+      entry.penalty,
+      entry.todaySalary,
+    ];
+
+    if (found) {
+      sheet.getRange(found.rowNumber, 1, 1, rowValues.length).setValues([rowValues]);
+      updated += 1;
+    } else {
+      toAppend.push(rowValues);
     }
-  }
-
-  const existingId = foundRow > 0 ? String(sheet.getRange(foundRow, 1).getValue() || '').trim() : '';
-  const rowId = existingId || Utilities.getUuid();
-
-  const rowValues = [[
-    rowId,
-    employeeId,
-    stripTime_(dateTime),
-    metrics.lateMinutes,
-    metrics.earlyMinutes,
-    metrics.outworkMinutes,
-    metrics.penalty,
-    metrics.todaySalary,
-  ]];
-
-  if (foundRow > 0) {
-    sheet.getRange(foundRow, 1, 1, rowValues[0].length).setValues(rowValues);
-  } else {
-    sheet.appendRow(rowValues[0]);
-  }
-}
-
-/* ------------------------------ Monthly Statistics ------------------------------ */
-
-function recalcMonthlyStatForEmployeeMonth_(employeeId, dateTime) {
-  const month = dateTime.getMonth() + 1;
-  const year = dateTime.getFullYear();
-
-  const attendanceMonth = getEmployeeAttendanceForMonth_(employeeId, month, year);
-  const dailyMonth = getEmployeeDailyStatsForMonth_(employeeId, month, year);
-
-  const workedDays = countUniqueDatesByStatus_(attendanceMonth, CONFIG.STATUS.ARRIVED);
-  const lateCount = dailyMonth.filter((r) => toNumber_(r.lateMinutes) > 0).length;
-  const overallLateHrs = sumBy_(dailyMonth, 'lateMinutes');
-  const earlyCount = dailyMonth.filter((r) => toNumber_(r.earlyMinutes) > 0).length;
-  const overallEarlyHrs = sumBy_(dailyMonth, 'earlyMinutes');
-  const outworkCount = attendanceMonth.filter((r) => r.status === CONFIG.STATUS.OUT_START).length;
-  const overallOutworkHrs = sumBy_(dailyMonth, 'outworkMinutes');
-  const totalPenalty = round2_(sumBy_(dailyMonth, 'penalty'));
-  const salary = round2_(sumBy_(dailyMonth, 'todaySalary'));
-
-  upsertMonthlyRow_({
-    employeeId,
-    month,
-    year,
-    workedDays,
-    lateCount,
-    overallLateHrs,
-    earlyCount,
-    overallEarlyHrs,
-    outworkCount,
-    overallOutworkHrs,
-    totalPenalty,
-    salary,
   });
+
+  if (toAppend.length > 0) {
+    const start = sheet.getLastRow() + 1;
+    sheet.getRange(start, 1, toAppend.length, toAppend[0].length).setValues(toAppend);
+  }
+
+  return { updated, inserted: toAppend.length };
 }
 
-function getEmployeeAttendanceForMonth_(employeeId, month, year) {
-  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
-  const values = sheet.getDataRange().getValues();
+/* ------------------------------ Monthly Worker ------------------------------ */
 
-  return values
-    .slice(1)
-    .map((row) => ({
-      employeeId: String(row[1] || '').trim(),
-      datetime: asDate_(row[2]),
-      status: String(row[3] || '').trim(),
-    }))
-    .filter((r) => r.employeeId === employeeId && r.datetime)
-    .filter((r) => r.datetime.getMonth() + 1 === month && r.datetime.getFullYear() === year);
-}
-
-function getEmployeeDailyStatsForMonth_(employeeId, month, year) {
+function getDailyRowsForMonth_(month, year) {
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.DAILY);
   const values = sheet.getDataRange().getValues();
 
@@ -628,58 +757,146 @@ function getEmployeeDailyStatsForMonth_(employeeId, month, year) {
       penalty: toNumber_(row[6]),
       todaySalary: toNumber_(row[7]),
     }))
-    .filter((r) => r.employeeId === employeeId && r.date)
-    .filter((r) => r.date.getMonth() + 1 === month && r.date.getFullYear() === year);
+    .filter((r) => r.employeeId && r.date)
+    .filter((r) => (r.date.getMonth() + 1) === month && r.date.getFullYear() === year);
 }
 
-function upsertMonthlyRow_(m) {
+function getAttendanceRowsForMonth_(month, year) {
+  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+  const values = sheet.getDataRange().getValues();
+
+  return values
+    .slice(1)
+    .map((row) => ({
+      employeeId: String(row[1] || '').trim(),
+      datetime: asDate_(row[2]),
+      status: String(row[3] || '').trim(),
+    }))
+    .filter((r) => r.employeeId && r.datetime)
+    .filter((r) => (r.datetime.getMonth() + 1) === month && r.datetime.getFullYear() === year);
+}
+
+function aggregateDailyByEmployee_(dailyRows) {
+  const map = new Map();
+
+  dailyRows.forEach((r) => {
+    if (!map.has(r.employeeId)) {
+      map.set(r.employeeId, {
+        lateCount: 0,
+        overallLateHrs: 0,
+        earlyCount: 0,
+        overallEarlyHrs: 0,
+        overallOutworkHrs: 0,
+        totalPenalty: 0,
+        salary: 0,
+      });
+    }
+
+    const agg = map.get(r.employeeId);
+    if (r.lateMinutes > 0) agg.lateCount += 1;
+    if (r.earlyMinutes > 0) agg.earlyCount += 1;
+
+    agg.overallLateHrs += r.lateMinutes;
+    agg.overallEarlyHrs += r.earlyMinutes;
+    agg.overallOutworkHrs += r.outworkMinutes;
+    agg.totalPenalty += r.penalty;
+    agg.salary += r.todaySalary;
+  });
+
+  return map;
+}
+
+function aggregateAttendanceByEmployee_(attendanceRows) {
+  const map = new Map();
+
+  attendanceRows.forEach((r) => {
+    if (!map.has(r.employeeId)) {
+      map.set(r.employeeId, {
+        workedDayKeys: new Set(),
+        outworkCount: 0,
+      });
+    }
+
+    const agg = map.get(r.employeeId);
+
+    if (r.status === CONFIG.STATUS.ARRIVED) {
+      agg.workedDayKeys.add(formatDateKey_(r.datetime));
+    }
+
+    if (r.status === CONFIG.STATUS.OUT_START) {
+      agg.outworkCount += 1;
+    }
+  });
+
+  const compact = new Map();
+  map.forEach((v, k) => {
+    compact.set(k, {
+      workedDays: v.workedDayKeys.size,
+      outworkCount: v.outworkCount,
+    });
+  });
+
+  return compact;
+}
+
+function upsertMonthlyEntries_(entries, month, year) {
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.MONTHLY);
   const values = sheet.getDataRange().getValues();
 
-  let foundRow = -1;
+  const existing = new Map();
   for (let i = 1; i < values.length; i += 1) {
-    const rowEmployeeId = String(values[i][1] || '').trim();
+    const employeeId = String(values[i][1] || '').trim();
     const rowMonth = toNumber_(values[i][2]);
     const rowYear = toNumber_(values[i][3]);
+    const rowId = String(values[i][0] || '').trim();
 
-    if (rowEmployeeId === m.employeeId && rowMonth === m.month && rowYear === m.year) {
-      foundRow = i + 1;
-      break;
+    if (!employeeId) continue;
+    if (rowMonth === month && rowYear === year) {
+      existing.set(employeeId, { rowNumber: i + 1, rowId });
     }
   }
 
-  const existingId = foundRow > 0 ? String(sheet.getRange(foundRow, 1).getValue() || '').trim() : '';
-  const rowId = existingId || Utilities.getUuid();
+  const toAppend = [];
+  let updated = 0;
 
-  const rowValues = [[
-    rowId,
-    m.employeeId,
-    m.month,
-    m.year,
-    m.workedDays,
-    m.lateCount,
-    m.overallLateHrs,
-    m.earlyCount,
-    m.overallEarlyHrs,
-    m.outworkCount,
-    m.overallOutworkHrs,
-    m.totalPenalty,
-    m.salary,
-  ]];
+  entries.forEach((m) => {
+    const found = existing.get(m.employeeId);
+    const rowValues = [
+      found && found.rowId ? found.rowId : Utilities.getUuid(),
+      m.employeeId,
+      m.month,
+      m.year,
+      m.workedDays,
+      m.lateCount,
+      m.overallLateHrs,
+      m.earlyCount,
+      m.overallEarlyHrs,
+      m.outworkCount,
+      m.overallOutworkHrs,
+      m.totalPenalty,
+      m.salary,
+    ];
 
-  if (foundRow > 0) {
-    sheet.getRange(foundRow, 1, 1, rowValues[0].length).setValues(rowValues);
-  } else {
-    sheet.appendRow(rowValues[0]);
+    if (found) {
+      sheet.getRange(found.rowNumber, 1, 1, rowValues.length).setValues([rowValues]);
+      updated += 1;
+    } else {
+      toAppend.push(rowValues);
+    }
+  });
+
+  if (toAppend.length > 0) {
+    const start = sheet.getLastRow() + 1;
+    sheet.getRange(start, 1, toAppend.length, toAppend[0].length).setValues(toAppend);
   }
+
+  return { updated, inserted: toAppend.length };
 }
 
 /* ------------------------------ Helpers ------------------------------ */
 
 function jsonResponse_(obj) {
-  return ContentService
-    .createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
 
 function httpError_(httpStatus, message) {
@@ -704,7 +921,6 @@ function toNumber_(value) {
 function asDate_(value) {
   if (value instanceof Date) return value;
   if (!value) return null;
-
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -743,15 +959,6 @@ function round2_(value) {
   return Math.round((toNumber_(value) + Number.EPSILON) * 100) / 100;
 }
 
-function sumBy_(arr, key) {
-  return arr.reduce((acc, item) => acc + toNumber_(item[key]), 0);
-}
-
-function countUniqueDatesByStatus_(attendanceRows, status) {
-  const keys = new Set(
-    attendanceRows
-      .filter((x) => x.status === status && x.datetime)
-      .map((x) => formatDateKey_(x.datetime))
-  );
-  return keys.size;
+function employeeDateKey_(employeeId, dateValue) {
+  return `${employeeId}|${formatDateKey_(dateValue)}`;
 }
