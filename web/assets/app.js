@@ -5,6 +5,7 @@ const API = Object.freeze({
 });
 
 const BRANCH_KEY = 'attendance.branch.v1';
+const IMAGE_QUEUE_KEY = 'attendance.image_upload_queue.v1';
 const STATUS_META = Object.freeze({
   Keldim: { iconType: 'material', iconName: 'login' },
   Ketdim: { iconType: 'material', iconName: 'logout' },
@@ -41,6 +42,7 @@ const el = {
 window.addEventListener('DOMContentLoaded', async () => {
   registerServiceWorker_();
   bindEvents_();
+  state.imageUploadQueue = readImageUploadQueue_();
 
   const branch = resolveBranch_();
   if (!branch && isStandalonePwa_()) {
@@ -52,6 +54,12 @@ window.addEventListener('DOMContentLoaded', async () => {
   await loadBootstrap_(branch);
   await initCamera_({ fromUserGesture: false });
   updateActionState_();
+  void flushImageUploads_();
+
+  // Keep retrying background image sync while app is open.
+  setInterval(() => {
+    void flushImageUploads_();
+  }, 60000);
 });
 
 window.addEventListener('online', () => {
@@ -324,7 +332,12 @@ async function submitAttendanceRequest_(request) {
 }
 
 function enqueueImageUpload_(entry) {
+  if (state.imageUploadQueue.length >= 20) {
+    showMessage_('Rasm navbati to‘lib qoldi. Internetni tekshirib qayta urinib ko‘ring.', 'err');
+    return;
+  }
   state.imageUploadQueue.push(entry);
+  writeImageUploadQueue_();
 }
 
 async function flushImageUploads_() {
@@ -342,11 +355,13 @@ async function flushImageUploads_() {
           throw new Error(result.error || 'Image upload failed');
         }
         state.imageUploadQueue.shift();
+        writeImageUploadQueue_();
       } catch (err) {
         current.tries = Number(current.tries || 0) + 1;
+        writeImageUploadQueue_();
         if (current.tries >= 3) {
-          state.imageUploadQueue.shift();
-          showMessage_('Davomat saqlandi, lekin rasm yuklanmadi. Internetni tekshirib qayta urinib ko‘ring.', 'err');
+          showMessage_('Davomat saqlandi, lekin rasm hali yuklanmadi. Internetni tekshirib ilovani ochiq qoldiring.', 'err');
+          break;
         } else {
           // Retry later without blocking user workflow.
           await waitMs_(1200 * current.tries);
@@ -392,6 +407,26 @@ async function submitAttendanceImageRequest_(payload) {
 
 function waitMs_(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readImageUploadQueue_() {
+  try {
+    const raw = localStorage.getItem(IMAGE_QUEUE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_err) {
+    return [];
+  }
+}
+
+function writeImageUploadQueue_() {
+  try {
+    localStorage.setItem(IMAGE_QUEUE_KEY, JSON.stringify(state.imageUploadQueue));
+  } catch (_err) {
+    // If storage quota is exceeded, keep in-memory queue and alert user.
+    showMessage_('Rasm navbatini saqlab bo‘lmadi. Internetni tekshirib yuborishni yakunlang.', 'err');
+  }
 }
 
 function setSaveLoading_(isLoading) {
@@ -444,8 +479,9 @@ function showMessage_(text, type, options = {}) {
   }
 
   const autoHideMs = Number(options.autoHideMs || 0);
+  const decoratedText = type === 'ok' ? `✅ ${text}` : text;
   el.message.className = `message ${type} show`;
-  el.message.textContent = text;
+  el.message.textContent = decoratedText;
 
   if (autoHideMs > 0) {
     state.toastTimer = setTimeout(() => {

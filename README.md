@@ -32,7 +32,7 @@ This version is optimized for reliability and speed:
 - Execute as: `Me`
 - Access: `Anyone`
 5. Open web app URL and verify JSON has:
-- `"version":"2.0.0"`
+- `"version":"2.1.0"`
 
 ## 2) Netlify Setup
 
@@ -58,6 +58,11 @@ Create **installable triggers** in Apps Script:
 - Frequency: Daily
 - Time: night (e.g., 23:00-23:59)
 
+3. Image sync reconciler (recommended)
+- Function: `reconcileAttendanceImageStatuses`
+- Event type: Time-driven
+- Frequency: Every 5 minutes (or 15 minutes)
+
 ## 4) First-Time Worker Initialization
 
 If you want worker to start from current attendance row and skip old historical rows:
@@ -81,6 +86,9 @@ If you want to process all history, do not run this initializer.
 2. Duplicate consecutive status is silently ignored (dedupe).
 3. `requestId` retries are idempotent.
 4. If background image upload fails, attendance row remains persisted and image upload is retried while app is open.
+5. Image sync state is tracked in `attendance`:
+- column 6: `image_sync_status` (`pending`, `uploaded`, `failed`)
+- column 7: `image_sync_at` (timestamp)
 
 ## 7) Testing Checklist
 

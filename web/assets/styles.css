@@ -212,32 +212,36 @@ img {
 .message {
   display: block;
   position: fixed;
-  top: 14px;
+  top: 18px;
   left: 50%;
-  transform: translateX(-50%) translateY(-8px);
+  transform: translateX(-50%) translateY(-10px) scale(0.98);
   opacity: 0;
   pointer-events: none;
   z-index: 9999;
-  width: min(92vw, 520px);
-  border-radius: 10px;
+  width: min(92vw, 560px);
+  border-radius: 12px;
   margin: 0;
-  padding: 10px;
-  font-size: 13px;
+  padding: 12px 14px;
+  font-size: 15px;
+  font-weight: 700;
+  text-align: center;
   box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
-  transition: opacity 0.16s ease, transform 0.16s ease;
+  transition: opacity 0.18s ease, transform 0.18s ease;
 }
 
 .message.show {
   opacity: 1;
-  transform: translateX(-50%) translateY(0);
+  transform: translateX(-50%) translateY(0) scale(1);
 }
 
 .message.ok {
   color: var(--success);
-  background: var(--success-bg);
+  background: #d1fae5;
+  border: 1px solid #86efac;
 }
 
 .message.err {
   color: var(--danger);
-  background: var(--danger-bg);
+  background: #fee2e2;
+  border: 1px solid #fca5a5;
 }

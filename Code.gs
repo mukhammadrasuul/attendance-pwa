@@ -18,7 +18,7 @@
  */
 
 const CONFIG = Object.freeze({
-  VERSION: '2.0.0',
+  VERSION: '2.1.0',
   SHEETS: Object.freeze({
     EMPLOYEES: 'xodimlar',
     ATTENDANCE: 'attendance',
@@ -30,6 +30,22 @@ const CONFIG = Object.freeze({
     LEFT: 'Ketdim',
     OUT_START: 'Ishim bor',
     OUT_END: 'Ishim bitdi',
+  }),
+  IMAGE_SYNC: Object.freeze({
+    PENDING: 'pending',
+    UPLOADED: 'uploaded',
+    FAILED: 'failed',
+  }),
+  COLS: Object.freeze({
+    ATTENDANCE: Object.freeze({
+      ID: 1,
+      EMPLOYEE_ID: 2,
+      DATETIME: 3,
+      STATUS: 4,
+      IMAGE_PATH: 5,
+      IMAGE_SYNC_STATUS: 6,
+      IMAGE_SYNC_AT: 7,
+    }),
   }),
   DRIVE: Object.freeze({
     ATTENDANCE_FOLDER_ID: '1kiqoaAJDx3967MzfcsgQVNCFggQ2aPSV',
@@ -114,7 +130,7 @@ function buildBootstrap_(branch) {
  */
 function submitAttendance_(payload) {
   const lock = LockService.getDocumentLock();
-  lock.waitLock(30000);
+  lock.waitLock(5000);
 
   try {
     const data = validateSubmission_(payload);
@@ -143,11 +159,18 @@ function submitAttendance_(payload) {
 
     const now = new Date();
     const attendanceId = data.requestId || Utilities.getUuid();
-    const imagePath = `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(attendanceId, 'jpg')}`;
+    let imagePath = `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(attendanceId, 'jpg')}`;
+    let imageSyncStatus = data.deferImageUpload ? CONFIG.IMAGE_SYNC.PENDING : CONFIG.IMAGE_SYNC.UPLOADED;
+    let imageSyncAt = data.deferImageUpload ? '' : new Date();
 
     if (!data.deferImageUpload) {
       // Backward-compatible mode if client still sends image in write request.
-      storeAttendanceImagePath_(data.imageData, attendanceId, imagePath);
+      const stored = storeAttendanceImagePath_(data.imageData, attendanceId, imagePath);
+      if (stored.path) imagePath = stored.path;
+      if (!stored.uploaded) {
+        imageSyncStatus = CONFIG.IMAGE_SYNC.FAILED;
+        imageSyncAt = '';
+      }
     }
 
     appendAttendanceRow_({
@@ -156,6 +179,8 @@ function submitAttendance_(payload) {
       datetime: now,
       status: data.status,
       imagePath,
+      imageSyncStatus,
+      imageSyncAt,
     });
 
     return {
@@ -167,6 +192,7 @@ function submitAttendance_(payload) {
       attendanceId,
       imagePath,
       imageDeferred: data.deferImageUpload,
+      imageSyncStatus,
       apiVersion: CONFIG.VERSION,
     };
   } finally {
@@ -179,23 +205,34 @@ function submitAttendance_(payload) {
  * Does not affect attendance write confirmation flow.
  */
 function uploadAttendanceImage_(payload) {
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(30000);
+  const data = validateImageUploadPayload_(payload);
 
   try {
-    const data = validateImageUploadPayload_(payload);
-    const imagePath = storeAttendanceImagePath_(data.imageData, data.attendanceId, data.imagePath);
-    updateAttendanceImagePathById_(data.attendanceId, imagePath);
+    const imagePath = saveAttendanceImageToDrive_(data.imageData, data.attendanceId, data.imagePath);
+    const pathUpdated = updateAttendanceImagePathById_(data.attendanceId, imagePath);
+    const syncUpdated = updateAttendanceImageSyncById_(data.attendanceId, CONFIG.IMAGE_SYNC.UPLOADED, new Date());
+    if (!pathUpdated || !syncUpdated) {
+      throw httpError_(404, `Attendance row not found for id: ${data.attendanceId}`);
+    }
 
     return {
       ok: true,
       persisted: true,
       attendanceId: data.attendanceId,
       imagePath,
+      imageSyncStatus: CONFIG.IMAGE_SYNC.UPLOADED,
       apiVersion: CONFIG.VERSION,
     };
-  } finally {
-    lock.releaseLock();
+  } catch (err) {
+    updateAttendanceImageSyncById_(data.attendanceId, CONFIG.IMAGE_SYNC.FAILED, '');
+    return {
+      ok: false,
+      persisted: false,
+      attendanceId: data.attendanceId,
+      error: err.message || 'Image upload failed',
+      imageSyncStatus: CONFIG.IMAGE_SYNC.FAILED,
+      apiVersion: CONFIG.VERSION,
+    };
   }
 }
 
@@ -206,8 +243,11 @@ function uploadAttendanceImage_(payload) {
  * Recommended trigger: every 1-5 minutes.
  */
 function processAttendanceToDailyStats(batchSize) {
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(30000);
+  const lock = LockService.getScriptLock();
+  const locked = lock.tryLock(1000);
+  if (!locked) {
+    return { ok: true, skipped: true, reason: 'worker_lock_busy' };
+  }
 
   try {
     const attendanceSheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
@@ -300,8 +340,11 @@ function processAttendanceToDailyStats(batchSize) {
  * Recommended trigger: once daily at night.
  */
 function runNightlyMonthlyRollup(targetMonth, targetYear) {
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(30000);
+  const lock = LockService.getScriptLock();
+  const locked = lock.tryLock(1000);
+  if (!locked) {
+    return { ok: true, skipped: true, reason: 'worker_lock_busy' };
+  }
 
   try {
     const now = new Date();
@@ -373,6 +416,54 @@ function initializeAttendanceCursorToCurrentLastRow() {
   const lastRow = attendanceSheet.getLastRow();
   setNumericProperty_(CONFIG.PROPS.ATT_LAST_PROCESSED_ROW, Math.max(1, lastRow));
   return { ok: true, cursor: Math.max(1, lastRow) };
+}
+
+/**
+ * Reconciler for image sync status.
+ * Marks pending/failed rows as uploaded if file exists in Drive folder.
+ * Recommended trigger: every 5-15 minutes.
+ */
+function reconcileAttendanceImageStatuses(maxRows) {
+  const lock = LockService.getScriptLock();
+  const locked = lock.tryLock(1000);
+  if (!locked) {
+    return { ok: true, skipped: true, reason: 'worker_lock_busy' };
+  }
+
+  try {
+    const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return { ok: true, scanned: 0, updated: 0 };
+
+    const cols = CONFIG.COLS.ATTENDANCE;
+    const rowsToScan = Math.min(lastRow - 1, Math.max(1, Number(maxRows) || CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS));
+    const startRow = lastRow - rowsToScan + 1;
+    const values = sheet.getRange(startRow, 1, rowsToScan, cols.IMAGE_SYNC_AT).getValues();
+    const folder = getAttendanceImageFolder_();
+
+    let updated = 0;
+    for (let i = values.length - 1; i >= 0; i -= 1) {
+      const rowNumber = startRow + i;
+      const imagePath = String(values[i][cols.IMAGE_PATH - 1] || '').trim();
+      const syncStatus = String(values[i][cols.IMAGE_SYNC_STATUS - 1] || '').trim().toLowerCase();
+      if (!imagePath) continue;
+      if (syncStatus !== CONFIG.IMAGE_SYNC.PENDING && syncStatus !== CONFIG.IMAGE_SYNC.FAILED) continue;
+
+      const fileName = fileNameFromPath_(imagePath);
+      if (!fileName) continue;
+
+      const found = folder.getFilesByName(fileName);
+      if (found.hasNext()) {
+        sheet.getRange(rowNumber, cols.IMAGE_SYNC_STATUS).setValue(CONFIG.IMAGE_SYNC.UPLOADED);
+        sheet.getRange(rowNumber, cols.IMAGE_SYNC_AT).setValue(new Date());
+        updated += 1;
+      }
+    }
+
+    return { ok: true, scanned: rowsToScan, updated };
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /* ------------------------------ Validation / Auth ------------------------------ */
@@ -567,12 +658,15 @@ function uzbekCyrillicToLatin_(text) {
 
 function appendAttendanceRow_(row) {
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+  const cols = CONFIG.COLS.ATTENDANCE;
   sheet.appendRow([
     row.attendanceId,
     row.employeeId,
     row.datetime,
     row.status,
     row.imagePath,
+    row.imageSyncStatus || CONFIG.IMAGE_SYNC.PENDING,
+    row.imageSyncAt || '',
   ]);
 }
 
@@ -619,12 +713,18 @@ function getAttendanceTailValues_(sheet, startCol, numCols, lookbackRows) {
 
 function storeAttendanceImagePath_(imageDataUrl, requestId, preferredPath) {
   try {
-    return saveAttendanceImageToDrive_(imageDataUrl, requestId, preferredPath);
+    return {
+      path: saveAttendanceImageToDrive_(imageDataUrl, requestId, preferredPath),
+      uploaded: true,
+    };
   } catch (err) {
     // Keep attendance write reliable even when Drive upload fails.
     console.error(`Image upload failed, fallback path used: ${err.message}`);
-    if (preferredPath) return preferredPath;
-    return `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(requestId, 'jpg')}`;
+    const fallbackPath = preferredPath || `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(requestId, 'jpg')}`;
+    return {
+      path: fallbackPath,
+      uploaded: false,
+    };
   }
 }
 
@@ -693,7 +793,17 @@ function updateAttendanceImagePathById_(attendanceId, imagePath) {
   if (!rowNumber) return false;
 
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
-  sheet.getRange(rowNumber, 5).setValue(imagePath);
+  sheet.getRange(rowNumber, CONFIG.COLS.ATTENDANCE.IMAGE_PATH).setValue(imagePath);
+  return true;
+}
+
+function updateAttendanceImageSyncById_(attendanceId, syncStatus, syncAt) {
+  const rowNumber = findAttendanceRowById_(attendanceId);
+  if (!rowNumber) return false;
+
+  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+  sheet.getRange(rowNumber, CONFIG.COLS.ATTENDANCE.IMAGE_SYNC_STATUS).setValue(syncStatus);
+  sheet.getRange(rowNumber, CONFIG.COLS.ATTENDANCE.IMAGE_SYNC_AT).setValue(syncAt || '');
   return true;
 }
 
