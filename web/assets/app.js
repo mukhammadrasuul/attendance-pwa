@@ -6,6 +6,13 @@ const API = Object.freeze({
 
 const BRANCH_KEY = 'attendance.branch.v1';
 const IMAGE_QUEUE_KEY = 'attendance.image_upload_queue.v1';
+const IMAGE_QUEUE_POLICY = Object.freeze({
+  BASE_RETRY_DELAY_MS: 1500,
+  MAX_RETRY_DELAY_MS: 5 * 60 * 1000,
+  ERROR_POPUP_COOLDOWN_MS: 5 * 60 * 1000,
+  MAX_TRIES: 24,
+  MAX_AGE_MS: 24 * 60 * 60 * 1000,
+});
 const STATUS_META = Object.freeze({
   Keldim: { iconType: 'material', iconName: 'login' },
   Ketdim: { iconType: 'material', iconName: 'logout' },
@@ -412,6 +419,9 @@ function enqueueImageUpload_(entry, shouldQueue = true) {
     state.imageUploadQueue[existingIndex] = {
       ...state.imageUploadQueue[existingIndex],
       ...entry,
+      tries: Number(state.imageUploadQueue[existingIndex].tries || 0),
+      createdAt: Number(state.imageUploadQueue[existingIndex].createdAt || Date.now()),
+      nextAttemptAt: 0,
     };
     writeImageUploadQueue_();
     return;
@@ -421,7 +431,13 @@ function enqueueImageUpload_(entry, shouldQueue = true) {
     showMessage_('Rasm navbati to‘lib qoldi. Internetni tekshirib qayta urinib ko‘ring.', 'err');
     return;
   }
-  state.imageUploadQueue.push(entry);
+  state.imageUploadQueue.push({
+    ...entry,
+    tries: Number(entry.tries || 0),
+    createdAt: Date.now(),
+    nextAttemptAt: 0,
+    lastErrorPopupAt: 0,
+  });
   writeImageUploadQueue_();
 }
 
@@ -432,8 +448,14 @@ async function flushImageUploads_() {
 
   state.imageUploadInFlight = true;
   try {
+    purgeStaleImageQueueItems_();
+
     while (state.imageUploadQueue.length > 0) {
-      const current = state.imageUploadQueue[0];
+      const now = Date.now();
+      const dueIndex = state.imageUploadQueue.findIndex((item) => Number(item.nextAttemptAt || 0) <= now);
+      if (dueIndex < 0) break;
+
+      const [current] = state.imageUploadQueue.splice(dueIndex, 1);
       try {
         const result = await submitAttendanceImageRequest_(current);
         const expectsRowUpdate = current.expectRowUpdate !== false;
@@ -441,22 +463,141 @@ async function flushImageUploads_() {
         if (!synced) {
           throw new Error(result.error || 'Image upload failed');
         }
-        state.imageUploadQueue.shift();
         writeImageUploadQueue_();
       } catch (err) {
         current.tries = Number(current.tries || 0) + 1;
-        writeImageUploadQueue_();
-        if (current.tries >= 3) {
-          showMessage_('Davomat saqlandi, lekin rasm hali yuklanmadi. Internetni tekshirib ilovani ochiq qoldiring.', 'err');
-          break;
-        } else {
-          // Retry later without blocking user workflow.
-          await waitMs_(1200 * current.tries);
+        const delay = nextImageRetryDelayMs_(current.tries);
+        current.nextAttemptAt = Date.now() + delay;
+
+        const ageMs = Date.now() - Number(current.createdAt || Date.now());
+        const expired = current.tries >= IMAGE_QUEUE_POLICY.MAX_TRIES || ageMs >= IMAGE_QUEUE_POLICY.MAX_AGE_MS;
+        if (expired) {
+          maybeShowImageQueueError_(current, true);
+          writeImageUploadQueue_();
+          continue;
         }
+
+        maybeShowImageQueueError_(current, false);
+        state.imageUploadQueue.push(current);
+        writeImageUploadQueue_();
       }
     }
   } finally {
     state.imageUploadInFlight = false;
+  }
+}
+
+function nextImageRetryDelayMs_(tries) {
+  const t = Math.max(1, Number(tries || 1));
+  const delay = IMAGE_QUEUE_POLICY.BASE_RETRY_DELAY_MS * (2 ** Math.min(t - 1, 8));
+  return Math.min(delay, IMAGE_QUEUE_POLICY.MAX_RETRY_DELAY_MS);
+}
+
+function maybeShowImageQueueError_(entry, finalDrop) {
+  const now = Date.now();
+  const lastShown = Number(entry.lastErrorPopupAt || 0);
+  if ((now - lastShown) < IMAGE_QUEUE_POLICY.ERROR_POPUP_COOLDOWN_MS) return;
+
+  entry.lastErrorPopupAt = now;
+  if (finalDrop) {
+    showMessage_('Baʼzi rasmlar uzoq vaqt yuklanmadi va navbatdan chiqarildi. Internetni tekshirib qayta yozing.', 'err', { autoHideMs: 4500 });
+    return;
+  }
+  showMessage_('Davomat saqlandi, lekin rasm hali yuklanmadi. Internetni tekshirib ilovani ochiq qoldiring.', 'err', { autoHideMs: 3500 });
+}
+
+function purgeStaleImageQueueItems_() {
+  const now = Date.now();
+  let changed = false;
+
+  state.imageUploadQueue = state.imageUploadQueue.filter((item) => {
+    const tries = Number(item && item.tries || 0);
+    const createdAt = Number(item && item.createdAt || now);
+    const tooOld = (now - createdAt) >= IMAGE_QUEUE_POLICY.MAX_AGE_MS;
+    const tooMany = tries >= IMAGE_QUEUE_POLICY.MAX_TRIES;
+    const keep = !tooOld && !tooMany;
+    changed = changed || !keep;
+    return keep;
+  });
+
+  if (changed) {
+    writeImageUploadQueue_();
+  }
+}
+
+function normalizeImageQueueEntry_(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const attendanceId = String(entry.attendanceId || '').trim();
+  const imageData = String(entry.imageData || '').trim();
+  if (!attendanceId || !imageData) return null;
+
+  const now = Date.now();
+  return {
+    attendanceId,
+    imagePath: String(entry.imagePath || '').trim(),
+    imageData,
+    expectRowUpdate: entry.expectRowUpdate !== false,
+    tries: Math.max(0, Number(entry.tries || 0)),
+    createdAt: Math.max(0, Number(entry.createdAt || now)),
+    nextAttemptAt: Math.max(0, Number(entry.nextAttemptAt || 0)),
+    lastErrorPopupAt: Math.max(0, Number(entry.lastErrorPopupAt || 0)),
+  };
+}
+
+function dedupeImageQueue_(items) {
+  const map = new Map();
+  items.forEach((item) => {
+    const key = item.attendanceId;
+    const current = map.get(key);
+    if (!current) {
+      map.set(key, item);
+      return;
+    }
+    map.set(key, {
+      ...current,
+      ...item,
+      tries: Math.min(current.tries, item.tries),
+      createdAt: Math.min(current.createdAt, item.createdAt),
+      nextAttemptAt: Math.min(current.nextAttemptAt, item.nextAttemptAt),
+      lastErrorPopupAt: Math.max(current.lastErrorPopupAt, item.lastErrorPopupAt),
+    });
+  });
+  return Array.from(map.values());
+}
+
+function readImageUploadQueue_() {
+  try {
+    const raw = localStorage.getItem(IMAGE_QUEUE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const normalized = parsed
+      .map((entry) => normalizeImageQueueEntry_(entry))
+      .filter(Boolean);
+    return dedupeImageQueue_(normalized);
+  } catch (_err) {
+    return [];
+  }
+}
+
+function writeImageUploadQueue_() {
+  try {
+    state.imageUploadQueue = dedupeImageQueue_(state.imageUploadQueue
+      .map((entry) => normalizeImageQueueEntry_(entry))
+      .filter(Boolean));
+    localStorage.setItem(IMAGE_QUEUE_KEY, JSON.stringify(state.imageUploadQueue));
+  } catch (_err) {
+    // If storage quota is exceeded, keep in-memory queue and alert user.
+    showMessage_('Rasm navbatini saqlab bo‘lmadi. Internetni tekshirib yuborishni yakunlang.', 'err');
+  }
+}
+
+function clearStuckImageQueue_() {
+  state.imageUploadQueue = [];
+  try {
+    localStorage.removeItem(IMAGE_QUEUE_KEY);
+  } catch (_err) {
+    // no-op
   }
 }
 
@@ -490,30 +631,6 @@ async function submitAttendanceImageRequest_(payload) {
   }
 
   return data;
-}
-
-function waitMs_(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function readImageUploadQueue_() {
-  try {
-    const raw = localStorage.getItem(IMAGE_QUEUE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_err) {
-    return [];
-  }
-}
-
-function writeImageUploadQueue_() {
-  try {
-    localStorage.setItem(IMAGE_QUEUE_KEY, JSON.stringify(state.imageUploadQueue));
-  } catch (_err) {
-    // If storage quota is exceeded, keep in-memory queue and alert user.
-    showMessage_('Rasm navbatini saqlab bo‘lmadi. Internetni tekshirib yuborishni yakunlang.', 'err');
-  }
 }
 
 function setSaveLoading_(isLoading) {
