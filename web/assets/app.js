@@ -141,19 +141,27 @@ function bindEvents_() {
       showMessage_('Avval rasmga oling.', 'err');
       return;
     }
+    if (!navigator.onLine) {
+      showMessage_('Internet aloqasi yo‘q. Tarmoqni tekshirib qayta urinib ko‘ring.', 'err');
+      return;
+    }
 
     const capturedImageData = state.capturedImageData;
     const attendanceId = state.draftAttendanceId || randomId_();
     const imagePath = state.preUploadedImagePath || state.draftImagePath || makeImagePath_(attendanceId);
+    const useInlineImageOnSave = state.preUploadStatus === 'failed';
     const request = {
       requestId: attendanceId,
       employeeId: state.selectedEmployeeId,
       status: state.selectedStatus,
-      deferImageUpload: true,
+      deferImageUpload: !useInlineImageOnSave,
       imagePath,
-      imageSyncStatus: state.preUploadStatus === 'uploaded' ? 'uploaded' : 'pending',
+      imageSyncStatus: useInlineImageOnSave ? '' : (state.preUploadStatus === 'uploaded' ? 'uploaded' : 'pending'),
       capturedAt: new Date().toISOString(),
     };
+    if (useInlineImageOnSave) {
+      request.imageData = capturedImageData;
+    }
 
     setSaveLoading_(true);
     clearMessage_();
@@ -173,7 +181,8 @@ function bindEvents_() {
 
       const shouldEnsureImageSync = result.wroteNewRow || result.idempotent === true;
       if (shouldEnsureImageSync) {
-        const needsRetryUpload = state.preUploadStatus !== 'uploaded';
+        const imageUploadedByServer = result.imageSyncStatus === 'uploaded';
+        const needsRetryUpload = !imageUploadedByServer && state.preUploadStatus !== 'uploaded';
         const effectiveAttendanceId = result.attendanceId || attendanceId;
         enqueueImageUpload_({
           attendanceId: effectiveAttendanceId,

@@ -167,7 +167,10 @@ function submitAttendance_(payload) {
       // Backward-compatible mode if client still sends image in write request.
       const stored = storeAttendanceImagePath_(data.imageData, attendanceId, imagePath);
       if (stored.path) imagePath = stored.path;
-      if (!stored.uploaded) {
+      if (stored.uploaded) {
+        imageSyncStatus = CONFIG.IMAGE_SYNC.UPLOADED;
+        imageSyncAt = new Date();
+      } else {
         imageSyncStatus = CONFIG.IMAGE_SYNC.FAILED;
         imageSyncAt = '';
       }
