@@ -171,13 +171,16 @@ function bindEvents_() {
         showMessage_('Muvaffaqiyatli saqlandi.', 'ok', { autoHideMs: 2000 });
       }
 
-      if (result.wroteNewRow && result.attendanceId) {
+      const shouldEnsureImageSync = result.wroteNewRow || result.idempotent === true;
+      if (shouldEnsureImageSync) {
         const needsRetryUpload = state.preUploadStatus !== 'uploaded';
+        const effectiveAttendanceId = result.attendanceId || attendanceId;
         enqueueImageUpload_({
-          attendanceId: result.attendanceId,
+          attendanceId: effectiveAttendanceId,
           imagePath: imagePath || result.imagePath || '',
           imageData: capturedImageData,
           tries: 0,
+          expectRowUpdate: true,
         }, needsRetryUpload);
         if (needsRetryUpload) {
           void flushImageUploads_();
@@ -392,6 +395,19 @@ async function submitAttendanceRequest_(request) {
 
 function enqueueImageUpload_(entry, shouldQueue = true) {
   if (!shouldQueue) return;
+  const key = String(entry && entry.attendanceId || '').trim();
+  if (!key) return;
+
+  const existingIndex = state.imageUploadQueue.findIndex((item) => String(item && item.attendanceId || '').trim() === key);
+  if (existingIndex >= 0) {
+    state.imageUploadQueue[existingIndex] = {
+      ...state.imageUploadQueue[existingIndex],
+      ...entry,
+    };
+    writeImageUploadQueue_();
+    return;
+  }
+
   if (state.imageUploadQueue.length >= 20) {
     showMessage_('Rasm navbati to‘lib qoldi. Internetni tekshirib qayta urinib ko‘ring.', 'err');
     return;
@@ -411,7 +427,9 @@ async function flushImageUploads_() {
       const current = state.imageUploadQueue[0];
       try {
         const result = await submitAttendanceImageRequest_(current);
-        if (!result.ok) {
+        const expectsRowUpdate = current.expectRowUpdate !== false;
+        const synced = result.ok && (!expectsRowUpdate || result.rowUpdated !== false);
+        if (!synced) {
           throw new Error(result.error || 'Image upload failed');
         }
         state.imageUploadQueue.shift();
