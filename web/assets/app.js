@@ -23,6 +23,10 @@ const state = {
   saveInFlight: false,
   imageUploadInFlight: false,
   imageUploadQueue: [],
+  draftAttendanceId: '',
+  draftImagePath: '',
+  preUploadStatus: 'idle',
+  preUploadedImagePath: '',
   toastTimer: null,
 };
 
@@ -80,6 +84,10 @@ function bindEvents_() {
     if (state.capturedImageData) {
       state.capturedImageData = '';
       el.snapshot.src = '';
+      state.draftAttendanceId = '';
+      state.draftImagePath = '';
+      state.preUploadStatus = 'idle';
+      state.preUploadedImagePath = '';
       showLive_();
       updateActionState_();
       showMessage_('Yangi rasm olish uchun yana bosing.', 'ok');
@@ -106,11 +114,16 @@ function bindEvents_() {
     ctx.drawImage(el.liveVideo, 0, 0, width, height);
 
     state.capturedImageData = el.captureCanvas.toDataURL('image/jpeg', 0.62);
+    state.draftAttendanceId = randomId_();
+    state.draftImagePath = makeImagePath_(state.draftAttendanceId);
+    state.preUploadStatus = 'uploading';
+    state.preUploadedImagePath = '';
 
     el.snapshot.src = state.capturedImageData;
     showSnapshot_();
     updateActionState_();
     showMessage_('Rasm olindi.', 'ok');
+    void startPreUpload_();
   });
 
   el.btnSave.addEventListener('click', async () => {
@@ -130,11 +143,15 @@ function bindEvents_() {
     }
 
     const capturedImageData = state.capturedImageData;
+    const attendanceId = state.draftAttendanceId || randomId_();
+    const imagePath = state.preUploadedImagePath || state.draftImagePath || makeImagePath_(attendanceId);
     const request = {
-      requestId: randomId_(),
+      requestId: attendanceId,
       employeeId: state.selectedEmployeeId,
       status: state.selectedStatus,
       deferImageUpload: true,
+      imagePath,
+      imageSyncStatus: state.preUploadStatus === 'uploaded' ? 'uploaded' : 'pending',
       capturedAt: new Date().toISOString(),
     };
 
@@ -155,13 +172,16 @@ function bindEvents_() {
       }
 
       if (result.wroteNewRow && result.attendanceId) {
+        const needsRetryUpload = state.preUploadStatus !== 'uploaded';
         enqueueImageUpload_({
           attendanceId: result.attendanceId,
-          imagePath: result.imagePath || '',
+          imagePath: imagePath || result.imagePath || '',
           imageData: capturedImageData,
           tries: 0,
-        });
-        void flushImageUploads_();
+        }, needsRetryUpload);
+        if (needsRetryUpload) {
+          void flushImageUploads_();
+        }
       }
 
       resetForm_();
@@ -291,12 +311,51 @@ function resetForm_() {
   state.selectedEmployeeId = '';
   state.selectedStatus = '';
   state.capturedImageData = '';
+  state.draftAttendanceId = '';
+  state.draftImagePath = '';
+  state.preUploadStatus = 'idle';
+  state.preUploadedImagePath = '';
 
   el.employeeSelect.value = '';
   [...el.statusGrid.querySelectorAll('.status-btn')].forEach((node) => node.classList.remove('active'));
 
   showLive_();
   updateActionState_();
+}
+
+async function startPreUpload_() {
+  if (!state.capturedImageData || !state.draftAttendanceId) return;
+  const draftId = state.draftAttendanceId;
+  const imageData = state.capturedImageData;
+
+  if (!navigator.onLine) {
+    if (state.draftAttendanceId === draftId) {
+      state.preUploadStatus = 'failed';
+    }
+    return;
+  }
+
+  try {
+    const result = await submitAttendanceImageRequest_({
+      attendanceId: draftId,
+      imagePath: state.draftImagePath || makeImagePath_(draftId),
+      imageData,
+      tries: 0,
+    });
+
+    if (state.draftAttendanceId !== draftId) return;
+
+    if (result.ok) {
+      state.preUploadStatus = 'uploaded';
+      state.preUploadedImagePath = result.imagePath || '';
+    } else {
+      state.preUploadStatus = 'failed';
+    }
+  } catch (_err) {
+    if (state.draftAttendanceId === draftId) {
+      state.preUploadStatus = 'failed';
+    }
+  }
 }
 
 async function submitAttendanceRequest_(request) {
@@ -331,7 +390,8 @@ async function submitAttendanceRequest_(request) {
   return data;
 }
 
-function enqueueImageUpload_(entry) {
+function enqueueImageUpload_(entry, shouldQueue = true) {
+  if (!shouldQueue) return;
   if (state.imageUploadQueue.length >= 20) {
     showMessage_('Rasm navbati to‘lib qoldi. Internetni tekshirib qayta urinib ko‘ring.', 'err');
     return;
@@ -513,6 +573,12 @@ function randomId_() {
     return window.crypto.randomUUID();
   }
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function makeImagePath_(attendanceId) {
+  const raw = String(attendanceId || randomId_()).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const shortId = (raw || randomId_().replace(/[^a-z0-9]/gi, '').toLowerCase()).slice(0, 8);
+  return `attendance_Images/${shortId}.${Date.now()}.jpg`;
 }
 
 function updateActionState_() {

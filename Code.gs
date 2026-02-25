@@ -18,7 +18,7 @@
  */
 
 const CONFIG = Object.freeze({
-  VERSION: '2.1.0',
+  VERSION: '2.2.0',
   SHEETS: Object.freeze({
     EMPLOYEES: 'xodimlar',
     ATTENDANCE: 'attendance',
@@ -159,8 +159,8 @@ function submitAttendance_(payload) {
 
     const now = new Date();
     const attendanceId = data.requestId || Utilities.getUuid();
-    let imagePath = `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(attendanceId, 'jpg')}`;
-    let imageSyncStatus = data.deferImageUpload ? CONFIG.IMAGE_SYNC.PENDING : CONFIG.IMAGE_SYNC.UPLOADED;
+    let imagePath = data.imagePath || `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(attendanceId, 'jpg')}`;
+    let imageSyncStatus = normalizeImageSyncStatus_(data.imageSyncStatus) || (data.deferImageUpload ? CONFIG.IMAGE_SYNC.PENDING : CONFIG.IMAGE_SYNC.UPLOADED);
     let imageSyncAt = data.deferImageUpload ? '' : new Date();
 
     if (!data.deferImageUpload) {
@@ -211,25 +211,24 @@ function uploadAttendanceImage_(payload) {
     const imagePath = saveAttendanceImageToDrive_(data.imageData, data.attendanceId, data.imagePath);
     const pathUpdated = updateAttendanceImagePathById_(data.attendanceId, imagePath);
     const syncUpdated = updateAttendanceImageSyncById_(data.attendanceId, CONFIG.IMAGE_SYNC.UPLOADED, new Date());
-    if (!pathUpdated || !syncUpdated) {
-      throw httpError_(404, `Attendance row not found for id: ${data.attendanceId}`);
-    }
 
     return {
       ok: true,
       persisted: true,
       attendanceId: data.attendanceId,
       imagePath,
+      rowUpdated: Boolean(pathUpdated && syncUpdated),
       imageSyncStatus: CONFIG.IMAGE_SYNC.UPLOADED,
       apiVersion: CONFIG.VERSION,
     };
   } catch (err) {
-    updateAttendanceImageSyncById_(data.attendanceId, CONFIG.IMAGE_SYNC.FAILED, '');
+    const syncUpdated = updateAttendanceImageSyncById_(data.attendanceId, CONFIG.IMAGE_SYNC.FAILED, '');
     return {
       ok: false,
       persisted: false,
       attendanceId: data.attendanceId,
       error: err.message || 'Image upload failed',
+      rowUpdated: Boolean(syncUpdated),
       imageSyncStatus: CONFIG.IMAGE_SYNC.FAILED,
       apiVersion: CONFIG.VERSION,
     };
@@ -491,6 +490,8 @@ function validateSubmission_(payload) {
   const imageData = String(payload.imageData || '').trim();
   const requestId = String(payload.requestId || '').trim();
   const deferImageUpload = Boolean(payload.deferImageUpload);
+  const imagePath = String(payload.imagePath || '').trim();
+  const imageSyncStatus = String(payload.imageSyncStatus || '').trim();
 
   if (!employeeId) throw httpError_(400, 'employeeId is required');
   if (!Object.values(CONFIG.STATUS).includes(status)) throw httpError_(400, 'Invalid status');
@@ -498,7 +499,7 @@ function validateSubmission_(payload) {
     throw httpError_(400, 'imageData must be data URL');
   }
 
-  return { employeeId, status, imageData, requestId, deferImageUpload };
+  return { employeeId, status, imageData, requestId, deferImageUpload, imagePath, imageSyncStatus };
 }
 
 function validateImageUploadPayload_(payload) {
@@ -512,6 +513,14 @@ function validateImageUploadPayload_(payload) {
   if (!imageData.startsWith('data:image/')) throw httpError_(400, 'imageData must be data URL');
 
   return { attendanceId, imageData, imagePath };
+}
+
+function normalizeImageSyncStatus_(statusRaw) {
+  const s = String(statusRaw || '').trim().toLowerCase();
+  if (s === CONFIG.IMAGE_SYNC.PENDING) return CONFIG.IMAGE_SYNC.PENDING;
+  if (s === CONFIG.IMAGE_SYNC.UPLOADED) return CONFIG.IMAGE_SYNC.UPLOADED;
+  if (s === CONFIG.IMAGE_SYNC.FAILED) return CONFIG.IMAGE_SYNC.FAILED;
+  return '';
 }
 
 /* ------------------------------ Spreadsheet Access ------------------------------ */
