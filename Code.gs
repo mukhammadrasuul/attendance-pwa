@@ -134,6 +134,7 @@ function submitAttendance_(payload) {
 
   try {
     const data = validateSubmission_(payload);
+    const now = new Date();
 
     if (data.requestId && attendanceIdExists_(data.requestId)) {
       return {
@@ -146,7 +147,7 @@ function submitAttendance_(payload) {
       };
     }
 
-    if (isConsecutiveDuplicate_(data.employeeId, data.status)) {
+    if (isConsecutiveDuplicate_(data.employeeId, data.status, now)) {
       return {
         ok: true,
         persisted: true,
@@ -157,7 +158,6 @@ function submitAttendance_(payload) {
       };
     }
 
-    const now = new Date();
     const attendanceId = data.requestId || Utilities.getUuid();
     let imagePath = data.imagePath || `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${makeAttendanceImageFileName_(attendanceId, 'jpg')}`;
     let imageSyncStatus = normalizeImageSyncStatus_(data.imageSyncStatus) || (data.deferImageUpload ? CONFIG.IMAGE_SYNC.PENDING : CONFIG.IMAGE_SYNC.UPLOADED);
@@ -695,14 +695,22 @@ function attendanceIdExists_(attendanceId) {
   return false;
 }
 
-function isConsecutiveDuplicate_(employeeId, status) {
+function isConsecutiveDuplicate_(employeeId, status, referenceDate) {
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
   // cols: employee id (2), datetime (3), status (4)
   const values = getAttendanceTailValues_(sheet, 2, 3, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
+  const targetDateKey = formatDateKey_(referenceDate || new Date());
 
   for (let i = values.length - 1; i >= 0; i -= 1) {
     const rowEmployeeId = String(values[i][0] || '').trim();
     if (rowEmployeeId !== employeeId) continue;
+
+    const lastDatetime = asDate_(values[i][1]);
+    if (!lastDatetime) continue;
+
+    if (formatDateKey_(lastDatetime) !== targetDateKey) {
+      return false;
+    }
 
     const lastStatus = String(values[i][2] || '').trim();
     return lastStatus === status;

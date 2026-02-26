@@ -38,6 +38,8 @@ const state = {
 };
 
 const el = {
+  appCard: document.querySelector('.card'),
+  mobileWarning: document.getElementById('mobileWarning'),
   branchText: document.getElementById('branchText'),
   employeeSelect: document.getElementById('employeeSelect'),
   statusGrid: document.getElementById('statusGrid'),
@@ -51,6 +53,11 @@ const el = {
 };
 
 window.addEventListener('DOMContentLoaded', async () => {
+  if (isMobilePhone_()) {
+    showMobileWarning_();
+    return;
+  }
+
   registerServiceWorker_();
   bindEvents_();
   state.imageUploadQueue = readImageUploadQueue_();
@@ -664,6 +671,18 @@ function resolveBranch_() {
 
 function isStandalonePwa_() {
   return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
+function isMobilePhone_() {
+  const ua = navigator.userAgent || '';
+  const mobileUa = /Android|iPhone|iPod|Windows Phone|IEMobile|Opera Mini|Mobile/i.test(ua);
+  const smallTouchDevice = window.matchMedia('(max-width: 820px)').matches && Number(navigator.maxTouchPoints || 0) > 0;
+  return mobileUa || smallTouchDevice;
+}
+
+function showMobileWarning_() {
+  if (el.appCard) el.appCard.style.display = 'none';
+  if (el.mobileWarning) el.mobileWarning.hidden = false;
 }
 
 function showCameraHint_(text) {
