@@ -33,7 +33,7 @@ This version is optimized for reliability and speed:
 - Execute as: `Me`
 - Access: `Anyone`
 5. Open web app URL and verify JSON has:
-- `"version":"2.3.1"`
+- `"version":"2.3.2"`
 
 ## 2) Netlify Setup
 
@@ -92,6 +92,9 @@ If you want to process all history, do not run this initializer.
 - column 7: `image_sync_at` (timestamp)
 6. Status sequence is validated per employee per day using `today_state`:
 - first status must be `Keldim`
+- `Keldim` -> `Ishim bor` or `Ketdim`
+- `Ishim bor` -> `Ishim bitdi`
+- `Ishim bitdi` -> `Ketdim`
 - invalid order returns `code: INVALID_SEQUENCE` with allowed next statuses
 
 ## 7) Testing Checklist

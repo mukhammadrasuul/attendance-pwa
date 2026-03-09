@@ -18,7 +18,7 @@
  */
 
 const CONFIG = Object.freeze({
-  VERSION: '2.3.1',
+  VERSION: '2.3.2',
   SHEETS: Object.freeze({
     EMPLOYEES: 'xodimlar',
     ATTENDANCE: 'attendance',
@@ -254,7 +254,12 @@ function uploadAttendanceImage_(payload) {
   const data = validateImageUploadPayload_(payload);
 
   try {
-    const imagePath = saveAttendanceImageToDrive_(data.imageData, data.attendanceId, data.imagePath);
+    const imagePath = saveAttendanceImageToDrive_(
+      data.imageData,
+      data.attendanceId,
+      data.imagePath,
+      { checkExistingFile: data.checkExistingFile }
+    );
     let rowUpdated = false;
 
     if (data.expectRowUpdate) {
@@ -571,11 +576,12 @@ function validateImageUploadPayload_(payload) {
   const imageData = String(payload.imageData || '').trim();
   const imagePath = String(payload.imagePath || '').trim();
   const expectRowUpdate = Boolean(payload.expectRowUpdate);
+  const checkExistingFile = payload.checkExistingFile !== false;
 
   if (!attendanceId) throw httpError_(400, 'attendanceId is required');
   if (!imageData.startsWith('data:image/')) throw httpError_(400, 'imageData must be data URL');
 
-  return { attendanceId, imageData, imagePath, expectRowUpdate };
+  return { attendanceId, imageData, imagePath, expectRowUpdate, checkExistingFile };
 }
 
 function normalizeImageSyncStatus_(statusRaw) {
@@ -848,10 +854,10 @@ function getAllowedNextStatuses_(lastStatusRaw) {
     return [CONFIG.STATUS.OUT_START, CONFIG.STATUS.LEFT];
   }
   if (lastStatus === CONFIG.STATUS.OUT_START) {
-    return [CONFIG.STATUS.OUT_END, CONFIG.STATUS.LEFT];
+    return [CONFIG.STATUS.OUT_END];
   }
   if (lastStatus === CONFIG.STATUS.OUT_END) {
-    return [CONFIG.STATUS.OUT_START, CONFIG.STATUS.LEFT];
+    return [CONFIG.STATUS.LEFT];
   }
   return [];
 }
@@ -917,7 +923,7 @@ function getAttendanceTailValues_(sheet, startCol, numCols, lookbackRows) {
 function storeAttendanceImagePath_(imageDataUrl, requestId, preferredPath) {
   try {
     return {
-      path: saveAttendanceImageToDrive_(imageDataUrl, requestId, preferredPath),
+      path: saveAttendanceImageToDrive_(imageDataUrl, requestId, preferredPath, { checkExistingFile: true }),
       uploaded: true,
     };
   } catch (err) {
@@ -931,17 +937,21 @@ function storeAttendanceImagePath_(imageDataUrl, requestId, preferredPath) {
   }
 }
 
-function saveAttendanceImageToDrive_(imageDataUrl, requestId, preferredPath) {
+function saveAttendanceImageToDrive_(imageDataUrl, requestId, preferredPath, options) {
   const parsed = parseDataUrlImage_(imageDataUrl);
   const folder = getAttendanceImageFolder_();
   const ext = extensionFromMimeType_(parsed.mimeType);
   const preferredFileName = fileNameFromPath_(preferredPath);
   const fileName = preferredFileName || makeAttendanceImageFileName_(requestId, ext);
+  const opts = options || {};
+  const checkExistingFile = opts.checkExistingFile !== false;
 
   // Retry-safe idempotency: if same filename already uploaded, reuse it.
-  const existing = folder.getFilesByName(fileName);
-  if (existing.hasNext()) {
-    return `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${fileName}`;
+  if (checkExistingFile) {
+    const existing = folder.getFilesByName(fileName);
+    if (existing.hasNext()) {
+      return `${CONFIG.DRIVE.ATTENDANCE_FOLDER_NAME}/${fileName}`;
+    }
   }
 
   const bytes = Utilities.base64Decode(parsed.base64Data);

@@ -393,6 +393,7 @@ async function startPreUpload_() {
       imagePath: state.draftImagePath || makeImagePath_(draftId),
       imageData,
       expectRowUpdate: false,
+      checkExistingFile: false,
       tries: 0,
     });
 
@@ -700,8 +701,8 @@ function getAllowedStatusesForLastStatus_(lastStatusRaw) {
   const lastStatus = String(lastStatusRaw || '').trim();
   if (!lastStatus) return ['Keldim'];
   if (lastStatus === 'Keldim') return ['Ishim bor', 'Ketdim'];
-  if (lastStatus === 'Ishim bor') return ['Ishim bitdi', 'Ketdim'];
-  if (lastStatus === 'Ishim bitdi') return ['Ishim bor', 'Ketdim'];
+  if (lastStatus === 'Ishim bor') return ['Ishim bitdi'];
+  if (lastStatus === 'Ishim bitdi') return ['Ketdim'];
   return [];
 }
 
