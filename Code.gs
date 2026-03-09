@@ -18,7 +18,7 @@
  */
 
 const CONFIG = Object.freeze({
-  VERSION: '2.3.0',
+  VERSION: '2.3.1',
   SHEETS: Object.freeze({
     EMPLOYEES: 'xodimlar',
     ATTENDANCE: 'attendance',
@@ -68,6 +68,8 @@ const CONFIG = Object.freeze({
   }),
   TIMEZONE: Session.getScriptTimeZone() || 'Asia/Tashkent',
 });
+
+let SPREADSHEET_CACHE = null;
 
 /* ------------------------------ HTTP Entrypoints ------------------------------ */
 
@@ -253,26 +255,42 @@ function uploadAttendanceImage_(payload) {
 
   try {
     const imagePath = saveAttendanceImageToDrive_(data.imageData, data.attendanceId, data.imagePath);
-    const pathUpdated = updateAttendanceImagePathById_(data.attendanceId, imagePath);
-    const syncUpdated = updateAttendanceImageSyncById_(data.attendanceId, CONFIG.IMAGE_SYNC.UPLOADED, new Date());
+    let rowUpdated = false;
+
+    if (data.expectRowUpdate) {
+      const rowNumber = findAttendanceRowById_(data.attendanceId, { fullScanFallback: true });
+      if (rowNumber) {
+        const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+        updateAttendanceImageRow_(sheet, rowNumber, imagePath, CONFIG.IMAGE_SYNC.UPLOADED, new Date());
+        rowUpdated = true;
+      }
+    }
 
     return {
       ok: true,
       persisted: true,
       attendanceId: data.attendanceId,
       imagePath,
-      rowUpdated: Boolean(pathUpdated && syncUpdated),
+      rowUpdated,
       imageSyncStatus: CONFIG.IMAGE_SYNC.UPLOADED,
       apiVersion: CONFIG.VERSION,
     };
   } catch (err) {
-    const syncUpdated = updateAttendanceImageSyncById_(data.attendanceId, CONFIG.IMAGE_SYNC.FAILED, '');
+    let rowUpdated = false;
+    if (data.expectRowUpdate) {
+      const rowNumber = findAttendanceRowById_(data.attendanceId, { fullScanFallback: true });
+      if (rowNumber) {
+        const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
+        updateAttendanceImageSyncRow_(sheet, rowNumber, CONFIG.IMAGE_SYNC.FAILED, '');
+        rowUpdated = true;
+      }
+    }
     return {
       ok: false,
       persisted: false,
       attendanceId: data.attendanceId,
       error: err.message || 'Image upload failed',
-      rowUpdated: Boolean(syncUpdated),
+      rowUpdated,
       imageSyncStatus: CONFIG.IMAGE_SYNC.FAILED,
       apiVersion: CONFIG.VERSION,
     };
@@ -530,7 +548,7 @@ function validateSubmission_(payload) {
   if (!payload || typeof payload !== 'object') throw httpError_(400, 'payload must be an object');
 
   const employeeId = String(payload.employeeId || '').trim();
-  const status = String(payload.status || '').trim();
+  const status = normalizeStatusValue_(payload.status);
   const imageData = String(payload.imageData || '').trim();
   const requestId = String(payload.requestId || '').trim();
   const deferImageUpload = Boolean(payload.deferImageUpload);
@@ -552,11 +570,12 @@ function validateImageUploadPayload_(payload) {
   const attendanceId = String(payload.attendanceId || '').trim();
   const imageData = String(payload.imageData || '').trim();
   const imagePath = String(payload.imagePath || '').trim();
+  const expectRowUpdate = Boolean(payload.expectRowUpdate);
 
   if (!attendanceId) throw httpError_(400, 'attendanceId is required');
   if (!imageData.startsWith('data:image/')) throw httpError_(400, 'imageData must be data URL');
 
-  return { attendanceId, imageData, imagePath };
+  return { attendanceId, imageData, imagePath, expectRowUpdate };
 }
 
 function normalizeImageSyncStatus_(statusRaw) {
@@ -570,23 +589,28 @@ function normalizeImageSyncStatus_(statusRaw) {
 /* ------------------------------ Spreadsheet Access ------------------------------ */
 
 function getSpreadsheet_() {
+  if (SPREADSHEET_CACHE) return SPREADSHEET_CACHE;
+
   const rawRef = getRequiredProperty_('SPREADSHEET_ID').trim();
   const spreadsheetId = extractSpreadsheetId_(rawRef);
 
-  if (/^https?:\/\//i.test(rawRef)) {
-    try {
-      return SpreadsheetApp.openByUrl(rawRef);
-    } catch (_errByUrl) {
-      // fallback below
-    }
-  }
-
   try {
-    return SpreadsheetApp.openById(spreadsheetId);
+    SPREADSHEET_CACHE = SpreadsheetApp.openById(spreadsheetId);
+    return SPREADSHEET_CACHE;
   } catch (_errById) {
+    if (/^https?:\/\//i.test(rawRef)) {
+      try {
+        SPREADSHEET_CACHE = SpreadsheetApp.openByUrl(rawRef);
+        return SPREADSHEET_CACHE;
+      } catch (_errByUrl) {
+        // fallback below
+      }
+    }
+
     try {
       const file = DriveApp.getFileById(spreadsheetId);
-      return SpreadsheetApp.open(file);
+      SPREADSHEET_CACHE = SpreadsheetApp.open(file);
+      return SPREADSHEET_CACHE;
     } catch (errByDrive) {
       throw httpError_(500, `Unable to open spreadsheet. Detail: ${errByDrive.message}`);
     }
@@ -744,8 +768,8 @@ function getTodayStateContext_() {
     map.set(employeeId, {
       rowNumber,
       id: String(values[i][cols.ID - 1] || '').trim(),
-      dateKey: String(values[i][cols.DATE_KEY - 1] || '').trim(),
-      lastStatus: String(values[i][cols.LAST_STATUS - 1] || '').trim(),
+      dateKey: normalizeDateKey_(values[i][cols.DATE_KEY - 1]),
+      lastStatus: normalizeStatusValue_(values[i][cols.LAST_STATUS - 1]),
     });
   }
 
@@ -776,7 +800,7 @@ function getCurrentTodayLastStatus_(todayStateMap, employeeId, referenceDate) {
 
   const targetDateKey = formatDateKey_(referenceDate || new Date());
   if (String(found.dateKey || '').trim() !== targetDateKey) return '';
-  return String(found.lastStatus || '').trim();
+  return normalizeStatusValue_(found.lastStatus);
 }
 
 function upsertTodayState_(ctx, employeeId, dateKey, lastStatus, updatedAt) {
@@ -785,11 +809,13 @@ function upsertTodayState_(ctx, employeeId, dateKey, lastStatus, updatedAt) {
 
   const sheet = ctx.sheet;
   const existing = ctx.map.get(employeeKey);
+  const normalizedDateKey = normalizeDateKey_(dateKey || updatedAt || new Date());
+  const normalizedLastStatus = normalizeStatusValue_(lastStatus);
   const rowValues = [
     existing && existing.id ? existing.id : Utilities.getUuid(),
     employeeKey,
-    String(dateKey || '').trim(),
-    String(lastStatus || '').trim(),
+    normalizedDateKey,
+    normalizedLastStatus,
     updatedAt || new Date(),
   ];
 
@@ -815,7 +841,7 @@ function upsertTodayState_(ctx, employeeId, dateKey, lastStatus, updatedAt) {
 }
 
 function getAllowedNextStatuses_(lastStatusRaw) {
-  const lastStatus = String(lastStatusRaw || '').trim();
+  const lastStatus = normalizeStatusValue_(lastStatusRaw);
   if (!lastStatus) return [CONFIG.STATUS.ARRIVED];
 
   if (lastStatus === CONFIG.STATUS.ARRIVED) {
@@ -966,7 +992,7 @@ function getAttendanceImageFolder_() {
 }
 
 function updateAttendanceImagePathById_(attendanceId, imagePath) {
-  const rowNumber = findAttendanceRowById_(attendanceId);
+  const rowNumber = findAttendanceRowById_(attendanceId, { fullScanFallback: true });
   if (!rowNumber) return false;
 
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
@@ -975,16 +1001,34 @@ function updateAttendanceImagePathById_(attendanceId, imagePath) {
 }
 
 function updateAttendanceImageSyncById_(attendanceId, syncStatus, syncAt) {
-  const rowNumber = findAttendanceRowById_(attendanceId);
+  const rowNumber = findAttendanceRowById_(attendanceId, { fullScanFallback: true });
   if (!rowNumber) return false;
 
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
-  sheet.getRange(rowNumber, CONFIG.COLS.ATTENDANCE.IMAGE_SYNC_STATUS).setValue(syncStatus);
-  sheet.getRange(rowNumber, CONFIG.COLS.ATTENDANCE.IMAGE_SYNC_AT).setValue(syncAt || '');
+  updateAttendanceImageSyncRow_(sheet, rowNumber, syncStatus, syncAt);
   return true;
 }
 
-function findAttendanceRowById_(attendanceId) {
+function updateAttendanceImageRow_(sheet, rowNumber, imagePath, syncStatus, syncAt) {
+  sheet.getRange(rowNumber, CONFIG.COLS.ATTENDANCE.IMAGE_PATH, 1, 3).setValues([[
+    imagePath || '',
+    syncStatus || '',
+    syncAt || '',
+  ]]);
+}
+
+function updateAttendanceImageSyncRow_(sheet, rowNumber, syncStatus, syncAt) {
+  sheet.getRange(rowNumber, CONFIG.COLS.ATTENDANCE.IMAGE_SYNC_STATUS, 1, 2).setValues([[
+    syncStatus || '',
+    syncAt || '',
+  ]]);
+}
+
+function findAttendanceRowById_(attendanceId, options) {
+  const opts = options || {};
+  const fullScanFallback = opts.fullScanFallback !== false;
+  const lookbackRows = Math.max(1, Number(opts.lookbackRows) || CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
+
   const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
   const id = String(attendanceId || '').trim();
   if (!id) return 0;
@@ -993,7 +1037,7 @@ function findAttendanceRowById_(attendanceId) {
   if (lastRow <= 1) return 0;
 
   // Fast pass over recent rows.
-  const rowsToRead = Math.min(lastRow - 1, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
+  const rowsToRead = Math.min(lastRow - 1, lookbackRows);
   const startRow = lastRow - rowsToRead + 1;
   const recentIds = sheet.getRange(startRow, 1, rowsToRead, 1).getValues();
   for (let i = recentIds.length - 1; i >= 0; i -= 1) {
@@ -1001,6 +1045,8 @@ function findAttendanceRowById_(attendanceId) {
       return startRow + i;
     }
   }
+
+  if (!fullScanFallback) return 0;
 
   // Full fallback for older rows.
   const allIds = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
@@ -1305,6 +1351,23 @@ function normalizeText_(value) {
     .toLowerCase();
 }
 
+function normalizeStatusValue_(statusRaw) {
+  const raw = String(statusRaw || '').trim();
+  if (!raw) return '';
+
+  const normalized = normalizeText_(raw).replace(/\s+/g, ' ');
+  const statuses = Object.values(CONFIG.STATUS);
+
+  for (let i = 0; i < statuses.length; i += 1) {
+    const candidate = statuses[i];
+    if (normalizeText_(candidate).replace(/\s+/g, ' ') === normalized) {
+      return candidate;
+    }
+  }
+
+  return raw;
+}
+
 function toNumber_(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : 0;
@@ -1319,6 +1382,29 @@ function asDate_(value) {
 
 function formatDateKey_(dateValue) {
   return Utilities.formatDate(asDate_(dateValue), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+}
+
+function normalizeDateKey_(value) {
+  if (value instanceof Date) return formatDateKey_(value);
+
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  const isoMatch = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${pad2_(isoMatch[2])}-${pad2_(isoMatch[3])}`;
+  }
+
+  const parsed = asDate_(raw);
+  if (parsed) return formatDateKey_(parsed);
+
+  return raw;
+}
+
+function pad2_(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value || '').trim();
+  return String(Math.floor(Math.abs(n))).padStart(2, '0');
 }
 
 function stripTime_(dateValue) {

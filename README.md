@@ -33,7 +33,7 @@ This version is optimized for reliability and speed:
 - Execute as: `Me`
 - Access: `Anyone`
 5. Open web app URL and verify JSON has:
-- `"version":"2.3.0"`
+- `"version":"2.3.1"`
 
 ## 2) Netlify Setup
 

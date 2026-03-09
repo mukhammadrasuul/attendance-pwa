@@ -392,6 +392,7 @@ async function startPreUpload_() {
       attendanceId: draftId,
       imagePath: state.draftImagePath || makeImagePath_(draftId),
       imageData,
+      expectRowUpdate: false,
       tries: 0,
     });
 
