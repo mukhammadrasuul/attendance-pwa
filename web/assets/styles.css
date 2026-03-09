@@ -119,6 +119,14 @@ select {
   box-shadow: 0 6px 14px rgba(15, 118, 110, 0.22);
 }
 
+.status-btn:disabled {
+  cursor: not-allowed;
+  color: #9ca3af;
+  background: #f3f4f6;
+  border-color: #e5e7eb;
+  box-shadow: none;
+}
+
 .status-icon {
   font-size: 18px;
   width: 24px;

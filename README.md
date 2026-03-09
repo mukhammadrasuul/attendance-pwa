@@ -20,6 +20,7 @@ This version is optimized for reliability and speed:
 2. `attendance`
 3. `statistika`
 4. `monthly statistics`
+5. `today_state` (auto-created if missing)
 
 ## 1) Apps Script Setup
 
@@ -32,7 +33,7 @@ This version is optimized for reliability and speed:
 - Execute as: `Me`
 - Access: `Anyone`
 5. Open web app URL and verify JSON has:
-- `"version":"2.1.0"`
+- `"version":"2.3.0"`
 
 ## 2) Netlify Setup
 
@@ -89,6 +90,9 @@ If you want to process all history, do not run this initializer.
 5. Image sync state is tracked in `attendance`:
 - column 6: `image_sync_status` (`pending`, `uploaded`, `failed`)
 - column 7: `image_sync_at` (timestamp)
+6. Status sequence is validated per employee per day using `today_state`:
+- first status must be `Keldim`
+- invalid order returns `code: INVALID_SEQUENCE` with allowed next statuses
 
 ## 7) Testing Checklist
 
@@ -98,6 +102,10 @@ If you want to process all history, do not run this initializer.
 3. Wait for daily worker trigger and confirm row updates in `statistika`.
 4. Run `runNightlyMonthlyRollup` manually once and verify `monthly statistics`.
 5. Retry same requestId (or duplicate same status) and verify no duplicate row write.
+6. Validation test:
+- choose employee with no record today, try `Ketdim` first -> must return validation error
+- then save `Keldim` -> must succeed
+- after `Ketdim`, try `Keldim` again same day -> must return validation error
 
 ## 8) Troubleshooting
 

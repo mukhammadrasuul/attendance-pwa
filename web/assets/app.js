@@ -22,6 +22,7 @@ const STATUS_META = Object.freeze({
 
 const state = {
   employees: [],
+  todayStateByEmployee: {},
   selectedEmployeeId: '',
   selectedStatus: '',
   capturedImageData: '',
@@ -160,14 +161,26 @@ function bindEvents_() {
       return;
     }
 
+    const selectedEmployeeId = state.selectedEmployeeId;
+    const selectedStatus = state.selectedStatus;
+    const employeeState = getEmployeeTodayState_(selectedEmployeeId);
+    if (!employeeState.allowedStatuses.includes(selectedStatus)) {
+      showMessage_(
+        invalidSequenceMessage_(employeeState.lastStatus, selectedStatus, employeeState.allowedStatuses),
+        'err',
+      );
+      updateActionState_();
+      return;
+    }
+
     const capturedImageData = state.capturedImageData;
     const attendanceId = state.draftAttendanceId || randomId_();
     const imagePath = state.preUploadedImagePath || state.draftImagePath || makeImagePath_(attendanceId);
     const useInlineImageOnSave = state.preUploadStatus === 'failed';
     const request = {
       requestId: attendanceId,
-      employeeId: state.selectedEmployeeId,
-      status: state.selectedStatus,
+      employeeId: selectedEmployeeId,
+      status: selectedStatus,
       deferImageUpload: !useInlineImageOnSave,
       imagePath,
       imageSyncStatus: useInlineImageOnSave ? '' : (state.preUploadStatus === 'uploaded' ? 'uploaded' : 'pending'),
@@ -183,9 +196,19 @@ function bindEvents_() {
     try {
       const result = await submitAttendanceRequest_(request);
       if (!result.ok) {
+        if (result.code === 'INVALID_SEQUENCE') {
+          syncEmployeeTodayState_(selectedEmployeeId, result.currentLastStatus, result.allowedStatuses);
+          if (!getEmployeeTodayState_(selectedEmployeeId).allowedStatuses.includes(state.selectedStatus)) {
+            state.selectedStatus = '';
+            [...el.statusGrid.querySelectorAll('.status-btn')].forEach((node) => node.classList.remove('active'));
+          }
+          updateActionState_();
+        }
         showMessage_(result.error || 'Saqlashda xatolik yuz berdi. Qayta urinib ko‘ring.', 'err');
         return;
       }
+
+      syncEmployeeTodayState_(selectedEmployeeId, result.currentLastStatus || selectedStatus, result.allowedStatuses);
 
       if (result.deduped && !result.wroteNewRow) {
         showMessage_('Takror holat aniqlandi. Yangi qator qo‘shilmadi.', 'ok', { autoHideMs: 2000 });
@@ -232,8 +255,10 @@ async function loadBootstrap_(branch) {
     }
 
     state.employees = Array.isArray(data.employees) ? data.employees : [];
+    state.todayStateByEmployee = (data.todayState && typeof data.todayState === 'object') ? data.todayState : {};
     renderEmployees_(state.employees);
     renderStatuses_(data.statuses || []);
+    updateActionState_();
 
     if (state.employees.length === 0) {
       showMessage_('Bu filial bo‘yicha faol xodim topilmadi.', 'err');
@@ -305,6 +330,7 @@ function renderStatuses_(statuses) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'status-btn';
+    btn.dataset.status = status;
     const meta = STATUS_META[status] || {};
     const iconHtml = meta.iconType === 'material'
       ? `<span class="status-icon material-symbols-outlined status-material">${escapeHtml_(meta.iconName || 'check')}</span>`
@@ -669,6 +695,56 @@ function resolveBranch_() {
   return saved;
 }
 
+function getAllowedStatusesForLastStatus_(lastStatusRaw) {
+  const lastStatus = String(lastStatusRaw || '').trim();
+  if (!lastStatus) return ['Keldim'];
+  if (lastStatus === 'Keldim') return ['Ishim bor', 'Ketdim'];
+  if (lastStatus === 'Ishim bor') return ['Ishim bitdi', 'Ketdim'];
+  if (lastStatus === 'Ishim bitdi') return ['Ishim bor', 'Ketdim'];
+  return [];
+}
+
+function getEmployeeTodayState_(employeeId) {
+  const id = String(employeeId || '').trim();
+  if (!id) return { lastStatus: '', allowedStatuses: [] };
+
+  const raw = state.todayStateByEmployee[id];
+  const lastStatus = String(raw && raw.lastStatus || '').trim();
+  const allowedStatuses = Array.isArray(raw && raw.allowedStatuses)
+    ? raw.allowedStatuses.map((s) => String(s || '').trim()).filter(Boolean)
+    : getAllowedStatusesForLastStatus_(lastStatus);
+  return { lastStatus, allowedStatuses };
+}
+
+function syncEmployeeTodayState_(employeeId, lastStatusRaw, allowedStatusesRaw) {
+  const id = String(employeeId || '').trim();
+  if (!id) return;
+  const lastStatus = String(lastStatusRaw || '').trim();
+  const allowedStatuses = Array.isArray(allowedStatusesRaw)
+    ? allowedStatusesRaw.map((s) => String(s || '').trim()).filter(Boolean)
+    : getAllowedStatusesForLastStatus_(lastStatus);
+  state.todayStateByEmployee[id] = { lastStatus, allowedStatuses };
+}
+
+function invalidSequenceMessage_(lastStatusRaw, nextStatusRaw, allowedStatusesRaw) {
+  const lastStatus = String(lastStatusRaw || '').trim();
+  const nextStatus = String(nextStatusRaw || '').trim();
+  const allowedStatuses = Array.isArray(allowedStatusesRaw)
+    ? allowedStatusesRaw.map((s) => String(s || '').trim()).filter(Boolean)
+    : [];
+
+  if (!lastStatus) {
+    return `"${nextStatus}" holatini yuborib bo‘lmaydi. Avval "Keldim" ni bosing.`;
+  }
+  if (lastStatus === 'Ketdim') {
+    return 'Bu xodim uchun bugungi davomat yopilgan (Ketdim).';
+  }
+  if (allowedStatuses.length === 0) {
+    return `"${nextStatus}" holati hozir ruxsat etilmagan.`;
+  }
+  return `"${nextStatus}" noto‘g‘ri ketma-ketlik. Ruxsat etilgan holatlar: ${allowedStatuses.join(', ')}.`;
+}
+
 function isStandalonePwa_() {
   return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
 }
@@ -746,6 +822,20 @@ function makeImagePath_(attendanceId) {
 
 function updateActionState_() {
   const hasEmployee = Boolean(state.selectedEmployeeId);
+  const employeeState = hasEmployee ? getEmployeeTodayState_(state.selectedEmployeeId) : { allowedStatuses: [], lastStatus: '' };
+  const allowedSet = new Set(employeeState.allowedStatuses);
+
+  [...el.statusGrid.querySelectorAll('.status-btn')].forEach((btn) => {
+    const status = String(btn.dataset.status || '').trim();
+    const enabled = hasEmployee && allowedSet.has(status) && !state.saveInFlight;
+    btn.disabled = !enabled;
+    if (!enabled) btn.classList.remove('active');
+  });
+
+  if (state.selectedStatus && !allowedSet.has(state.selectedStatus)) {
+    state.selectedStatus = '';
+  }
+
   const hasStatus = Boolean(state.selectedStatus);
   const hasPhoto = Boolean(state.capturedImageData);
 

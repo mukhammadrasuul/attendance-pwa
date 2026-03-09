@@ -18,12 +18,13 @@
  */
 
 const CONFIG = Object.freeze({
-  VERSION: '2.2.0',
+  VERSION: '2.3.0',
   SHEETS: Object.freeze({
     EMPLOYEES: 'xodimlar',
     ATTENDANCE: 'attendance',
     DAILY: 'statistika',
     MONTHLY: 'monthly statistics',
+    TODAY_STATE: 'today_state',
   }),
   STATUS: Object.freeze({
     ARRIVED: 'Keldim',
@@ -45,6 +46,13 @@ const CONFIG = Object.freeze({
       IMAGE_PATH: 5,
       IMAGE_SYNC_STATUS: 6,
       IMAGE_SYNC_AT: 7,
+    }),
+    TODAY_STATE: Object.freeze({
+      ID: 1,
+      EMPLOYEE_ID: 2,
+      DATE_KEY: 3,
+      LAST_STATUS: 4,
+      UPDATED_AT: 5,
     }),
   }),
   DRIVE: Object.freeze({
@@ -107,11 +115,23 @@ function doPost(e) {
 
 function buildBootstrap_(branch) {
   const employees = getActiveEmployeesByBranch_(branch);
+  const employeeIds = new Set(employees.map((emp) => emp.id));
+  const todayStateMap = getTodayStateMapForEmployees_(employeeIds, new Date());
+  const todayState = {};
+
+  employees.forEach((emp) => {
+    const lastStatus = String(todayStateMap.get(emp.id) || '').trim();
+    todayState[emp.id] = {
+      lastStatus,
+      allowedStatuses: getAllowedNextStatuses_(lastStatus),
+    };
+  });
 
   return {
     ok: true,
     branch,
     employees,
+    todayState,
     statuses: [
       CONFIG.STATUS.ARRIVED,
       CONFIG.STATUS.LEFT,
@@ -147,13 +167,31 @@ function submitAttendance_(payload) {
       };
     }
 
-    if (isConsecutiveDuplicate_(data.employeeId, data.status, now)) {
+    const todayStateCtx = getTodayStateContext_();
+    const currentLastStatus = getCurrentTodayLastStatus_(todayStateCtx.map, data.employeeId, now);
+    if (currentLastStatus === data.status) {
       return {
         ok: true,
         persisted: true,
         wroteNewRow: false,
         deduped: true,
         idempotent: false,
+        currentLastStatus,
+        allowedStatuses: getAllowedNextStatuses_(currentLastStatus),
+        apiVersion: CONFIG.VERSION,
+      };
+    }
+
+    const allowedStatuses = getAllowedNextStatuses_(currentLastStatus);
+    if (!allowedStatuses.includes(data.status)) {
+      return {
+        ok: false,
+        persisted: false,
+        status: 409,
+        code: 'INVALID_SEQUENCE',
+        error: invalidTransitionMessage_(currentLastStatus, data.status, allowedStatuses),
+        currentLastStatus,
+        allowedStatuses,
         apiVersion: CONFIG.VERSION,
       };
     }
@@ -185,6 +223,7 @@ function submitAttendance_(payload) {
       imageSyncStatus,
       imageSyncAt,
     });
+    upsertTodayState_(todayStateCtx, data.employeeId, formatDateKey_(now), data.status, now);
 
     return {
       ok: true,
@@ -196,6 +235,8 @@ function submitAttendance_(payload) {
       imagePath,
       imageDeferred: data.deferImageUpload,
       imageSyncStatus,
+      currentLastStatus: data.status,
+      allowedStatuses: getAllowedNextStatuses_(data.status),
       apiVersion: CONFIG.VERSION,
     };
   } finally {
@@ -666,6 +707,146 @@ function uzbekCyrillicToLatin_(text) {
   return output;
 }
 
+function getTodayStateSheet_() {
+  const ss = getSpreadsheet_();
+  let sheet = ss.getSheetByName(CONFIG.SHEETS.TODAY_STATE);
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.SHEETS.TODAY_STATE);
+  }
+
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(['state id', 'employee id', 'date key', 'last status', 'updated at']);
+  } else {
+    const firstCell = String(sheet.getRange(1, 1).getValue() || '').trim().toLowerCase();
+    if (firstCell !== 'state id') {
+      sheet.insertRowBefore(1);
+      sheet.getRange(1, 1, 1, 5).setValues([['state id', 'employee id', 'date key', 'last status', 'updated at']]);
+    }
+  }
+
+  return sheet;
+}
+
+function getTodayStateContext_() {
+  const sheet = getTodayStateSheet_();
+  const lastRow = sheet.getLastRow();
+  const map = new Map();
+  const cols = CONFIG.COLS.TODAY_STATE;
+
+  if (lastRow <= 1) return { sheet, map };
+
+  const values = sheet.getRange(2, 1, lastRow - 1, cols.UPDATED_AT).getValues();
+  for (let i = 0; i < values.length; i += 1) {
+    const rowNumber = i + 2;
+    const employeeId = String(values[i][cols.EMPLOYEE_ID - 1] || '').trim();
+    if (!employeeId) continue;
+
+    map.set(employeeId, {
+      rowNumber,
+      id: String(values[i][cols.ID - 1] || '').trim(),
+      dateKey: String(values[i][cols.DATE_KEY - 1] || '').trim(),
+      lastStatus: String(values[i][cols.LAST_STATUS - 1] || '').trim(),
+    });
+  }
+
+  return { sheet, map };
+}
+
+function getTodayStateMapForEmployees_(employeeIds, referenceDate) {
+  const dateKey = formatDateKey_(referenceDate || new Date());
+  const ids = new Set(Array.from(employeeIds || []).map((id) => String(id || '').trim()).filter(Boolean));
+  if (ids.size === 0) return new Map();
+
+  const ctx = getTodayStateContext_();
+  const map = new Map();
+  ids.forEach((employeeId) => {
+    const found = ctx.map.get(employeeId);
+    if (!found || found.dateKey !== dateKey) return;
+    map.set(employeeId, found.lastStatus);
+  });
+  return map;
+}
+
+function getCurrentTodayLastStatus_(todayStateMap, employeeId, referenceDate) {
+  const employeeKey = String(employeeId || '').trim();
+  if (!employeeKey) return '';
+
+  const found = todayStateMap.get(employeeKey);
+  if (!found) return '';
+
+  const targetDateKey = formatDateKey_(referenceDate || new Date());
+  if (String(found.dateKey || '').trim() !== targetDateKey) return '';
+  return String(found.lastStatus || '').trim();
+}
+
+function upsertTodayState_(ctx, employeeId, dateKey, lastStatus, updatedAt) {
+  const employeeKey = String(employeeId || '').trim();
+  if (!employeeKey) return;
+
+  const sheet = ctx.sheet;
+  const existing = ctx.map.get(employeeKey);
+  const rowValues = [
+    existing && existing.id ? existing.id : Utilities.getUuid(),
+    employeeKey,
+    String(dateKey || '').trim(),
+    String(lastStatus || '').trim(),
+    updatedAt || new Date(),
+  ];
+
+  if (existing) {
+    sheet.getRange(existing.rowNumber, 1, 1, rowValues.length).setValues([rowValues]);
+    ctx.map.set(employeeKey, {
+      rowNumber: existing.rowNumber,
+      id: rowValues[0],
+      dateKey: rowValues[2],
+      lastStatus: rowValues[3],
+    });
+    return;
+  }
+
+  const rowNumber = sheet.getLastRow() + 1;
+  sheet.getRange(rowNumber, 1, 1, rowValues.length).setValues([rowValues]);
+  ctx.map.set(employeeKey, {
+    rowNumber,
+    id: rowValues[0],
+    dateKey: rowValues[2],
+    lastStatus: rowValues[3],
+  });
+}
+
+function getAllowedNextStatuses_(lastStatusRaw) {
+  const lastStatus = String(lastStatusRaw || '').trim();
+  if (!lastStatus) return [CONFIG.STATUS.ARRIVED];
+
+  if (lastStatus === CONFIG.STATUS.ARRIVED) {
+    return [CONFIG.STATUS.OUT_START, CONFIG.STATUS.LEFT];
+  }
+  if (lastStatus === CONFIG.STATUS.OUT_START) {
+    return [CONFIG.STATUS.OUT_END, CONFIG.STATUS.LEFT];
+  }
+  if (lastStatus === CONFIG.STATUS.OUT_END) {
+    return [CONFIG.STATUS.OUT_START, CONFIG.STATUS.LEFT];
+  }
+  return [];
+}
+
+function invalidTransitionMessage_(lastStatusRaw, nextStatusRaw, allowedStatuses) {
+  const lastStatus = String(lastStatusRaw || '').trim();
+  const nextStatus = String(nextStatusRaw || '').trim();
+  const allowed = Array.isArray(allowedStatuses) ? allowedStatuses : [];
+
+  if (!lastStatus) {
+    return `"${nextStatus}" holatini yuborib bo‘lmaydi. Avval "Keldim" ni bosing.`;
+  }
+  if (lastStatus === CONFIG.STATUS.LEFT) {
+    return 'Bu xodim uchun bugungi davomat yopilgan (Ketdim).';
+  }
+  if (allowed.length === 0) {
+    return `"${nextStatus}" holati hozir ruxsat etilmagan.`;
+  }
+  return `"${nextStatus}" noto‘g‘ri ketma-ketlik. Ruxsat etilgan holatlar: ${allowed.join(', ')}.`;
+}
+
 /* ------------------------------ Attendance Writes ------------------------------ */
 
 function appendAttendanceRow_(row) {
@@ -690,30 +871,6 @@ function attendanceIdExists_(attendanceId) {
 
   for (let i = values.length - 1; i >= 0; i -= 1) {
     if (String(values[i][0] || '').trim() === attendanceId) return true;
-  }
-
-  return false;
-}
-
-function isConsecutiveDuplicate_(employeeId, status, referenceDate) {
-  const sheet = getSheetOrThrow_(CONFIG.SHEETS.ATTENDANCE);
-  // cols: employee id (2), datetime (3), status (4)
-  const values = getAttendanceTailValues_(sheet, 2, 3, CONFIG.PERF.ATTENDANCE_LOOKBACK_ROWS);
-  const targetDateKey = formatDateKey_(referenceDate || new Date());
-
-  for (let i = values.length - 1; i >= 0; i -= 1) {
-    const rowEmployeeId = String(values[i][0] || '').trim();
-    if (rowEmployeeId !== employeeId) continue;
-
-    const lastDatetime = asDate_(values[i][1]);
-    if (!lastDatetime) continue;
-
-    if (formatDateKey_(lastDatetime) !== targetDateKey) {
-      return false;
-    }
-
-    const lastStatus = String(values[i][2] || '').trim();
-    return lastStatus === status;
   }
 
   return false;
